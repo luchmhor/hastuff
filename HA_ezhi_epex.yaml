@@ -3,14 +3,200 @@ description: >-
   Manages battery charge/discharge based on grid power, electricity price, and
   battery SOC with improved rule hierarchy and PV curtailment prevention. All
   parameters are centrally managed in the variables section.
-
-# =======================================================================================
-# VARIABLES & CONSTANTS
-# =======================================================================================
+triggers:
+  - entity_id: sensor.shrdzm_485519e15aae_16_7_0
+    trigger: state
+actions:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ rule_suppress_feed_in_condition }}"
+        sequence:
+          - target:
+              entity_id: "{{ entities.inverter_output_control }}"
+            data:
+              value: 0
+            action: number.set_value
+          - target:
+              entity_id: "{{ entities.active_rule }}"
+            data:
+              value: "Rule 2: Suppress Grid Feed-in"
+            action: input_text.set_value
+          - target:
+              entity_id: "{{ entities.status_message }}"
+            data:
+              value: >
+                Price {{ current_hour_price }}€ is below threshold ({{
+                constants.no_feed_in_price_threshold }}€). Feed-in suppressed.
+            action: input_text.set_value
+      - conditions:
+          - condition: template
+            value_template: "{{ rule_pv_curtailment_condition }}"
+        sequence:
+          - variables:
+              output_increase: >-
+                {% if battery_power > constants.pv_curtailment_power_threshold
+                %}
+                  {{ (battery_power * constants.pv_curtailment_increase_factor) | round(0) }}
+                {% else %}
+                  {{ constants.pv_curtailment_min_increase_step }}
+                {% endif %}
+              new_output: >-
+                {{ [current_output + output_increase,
+                constants.output_max_limit] | min }}
+          - target:
+              entity_id: "{{ entities.inverter_output_control }}"
+            data:
+              value: "{{ new_output }}"
+            action: number.set_value
+          - target:
+              entity_id: "{{ entities.active_rule }}"
+            data:
+              value: "Rule 4: PV Curtailment Prevention - Increasing Output"
+            action: input_text.set_value
+          - target:
+              entity_id: "{{ entities.status_message }}"
+            data:
+              value: >
+                Battery full ({{ battery_soc }}%), charging at {{ battery_power
+                }}W. Increasing output to {{ new_output }}W to prevent PV
+                curtailment.
+            action: input_text.set_value
+      - conditions:
+          - condition: template
+            value_template: "{{ rule_battery_full_discharging_condition }}"
+        sequence:
+          - variables:
+              output_decrease: >-
+                {{ [(battery_power | abs *
+                constants.battery_full_decrease_factor) | round(0),
+                constants.battery_full_min_decrease_step] | max }}
+              new_output: >-
+                {{ [current_output - output_decrease,
+                constants.output_min_limit] | max }}
+          - target:
+              entity_id: "{{ entities.inverter_output_control }}"
+            data:
+              value: "{{ new_output }}"
+            action: number.set_value
+          - target:
+              entity_id: "{{ entities.active_rule }}"
+            data:
+              value: "Rule 4: Battery Full - Optimizing Output"
+            action: input_text.set_value
+          - target:
+              entity_id: "{{ entities.status_message }}"
+            data:
+              value: >
+                Battery at {{ battery_soc }}% discharging {{ battery_power | abs
+                }}W. Reducing output to {{ new_output }}W to balance system.
+            action: input_text.set_value
+      - conditions:
+          - condition: template
+            value_template: "{{ rule_charge_from_grid_condition }}"
+        sequence:
+          - target:
+              entity_id: "{{ entities.inverter_output_control }}"
+            data:
+              value: "{{ constants.output_min_limit }}"
+            action: number.set_value
+          - target:
+              entity_id: "{{ entities.active_rule }}"
+            data:
+              value: "Rule 3: Aggressive Grid Charging"
+            action: input_text.set_value
+          - target:
+              entity_id: "{{ entities.status_message }}"
+            data:
+              value: >
+                Optimal price ({{ current_hour_price }}€ < {{
+                (highest_future_price * constants.grid_charge_price_factor) |
+                round(3) }}€). Charging from grid at max power. SOC: {{
+                battery_soc }}% < {{ hourly_soc_threshold }}%.
+            action: input_text.set_value
+    default:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ grid_power > constants.grid_power_deadzone }}"
+            sequence:
+              - variables:
+                  step: >-
+                    {% set power_abs = grid_power | abs %} {% set step_factor =
+                    constants.step_factor_high if power_abs >
+                    constants.grid_power_threshold else
+                    constants.step_factor_low %} {{ [(power_abs * step_factor) |
+                    round(0), constants.grid_follow_min_step] | max }}
+                  new_output: >-
+                    {{ [current_output + step, constants.output_max_limit] | min
+                    }}
+              - target:
+                  entity_id: "{{ entities.inverter_output_control }}"
+                data:
+                  value: "{{ new_output }}"
+                action: number.set_value
+              - target:
+                  entity_id: "{{ entities.active_rule }}"
+                data:
+                  value: "Rule 1: Grid Follow - Reducing Import"
+                action: input_text.set_value
+              - target:
+                  entity_id: "{{ entities.status_message }}"
+                data:
+                  value: >-
+                    Importing {{ grid_power }}W from grid. Increasing output by
+                    {{ step }}W to {{ new_output }}W.
+                action: input_text.set_value
+          - conditions:
+              - condition: template
+                value_template: "{{ grid_power < -constants.grid_power_deadzone }}"
+            sequence:
+              - variables:
+                  step: >-
+                    {% set power_abs = grid_power | abs %} {% set step_factor =
+                    constants.step_factor_high if power_abs >
+                    constants.grid_power_threshold else
+                    constants.step_factor_low %} {{ [(power_abs * step_factor) |
+                    round(0), constants.grid_follow_min_step] | max }}
+                  new_output: >-
+                    {{ [current_output - step, constants.output_min_limit] | max
+                    }}
+              - target:
+                  entity_id: "{{ entities.inverter_output_control }}"
+                data:
+                  value: "{{ new_output }}"
+                action: number.set_value
+              - target:
+                  entity_id: "{{ entities.active_rule }}"
+                data:
+                  value: "Rule 1: Grid Follow - Reducing Export"
+                action: input_text.set_value
+              - target:
+                  entity_id: "{{ entities.status_message }}"
+                data:
+                  value: >-
+                    Exporting {{ grid_power | abs }}W to grid. Decreasing output
+                    by {{ step }}W to {{ new_output }}W.
+                action: input_text.set_value
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ grid_power >= -constants.grid_power_deadzone and grid_power
+                  <= constants.grid_power_deadzone }}
+            sequence:
+              - target:
+                  entity_id: "{{ entities.active_rule }}"
+                data:
+                  value: "Rule 1: Grid Balanced"
+                action: input_text.set_value
+              - target:
+                  entity_id: "{{ entities.status_message }}"
+                data:
+                  value: >-
+                    Grid balanced at {{ grid_power }}W. Output stable at {{
+                    current_output }}W.
+                action: input_text.set_value
 variables:
-  # -----------------------------------------------------------------------------------
-  # ENTITY MAPPING: Map your own entity IDs here.
-  # -----------------------------------------------------------------------------------
   entities:
     grid_power: sensor.shrdzm_485519e15aae_16_7_0
     battery_soc: sensor.ezhi_battery_state_of_charge
@@ -19,283 +205,72 @@ variables:
     price_data: sensor.epex_spot_data_price
     active_rule: input_text.solar_battery_active_rule
     status_message: input_text.solar_battery_status_message
-
-  # -----------------------------------------------------------------------------------
-  # CONSTANTS: Adjust the automation's behavior here.
-  # -----------------------------------------------------------------------------------
   constants:
-    # --- General Thresholds ---
-    output_min_limit: -1200          # (W) Minimum inverter output (grid charging).
-    output_max_limit: 1200           # (W) Maximum inverter output (grid feed-in).
-    battery_full_threshold: 93       # (%) SOC level considered full.
-    grid_power_deadzone: 10          # (W) The range around 0W to consider the grid balanced.
-
-    # --- Rule 1: Grid Following Parameters (SIMPLIFIED) ---
-    grid_power_threshold: 50         # (W) Single threshold: use factor 1.0 above this, 0.5 below/at this.
-    step_factor_high: 1.0            # Multiplier for absolute grid power > grid_power_threshold.
-    step_factor_low: 0.5             # Multiplier for absolute grid power <= grid_power_threshold.
-    grid_follow_min_step: 10         # (W) Smallest step change.
-
-    # --- Rule 2: Suppress Feed-in Parameters ---
-    no_feed_in_price_threshold: 0.05 # (€/kWh) Don't feed-in if the price is below this.
-
-    # --- Rule 3: Grid Charging Parameters ---
-    grid_charge_price_factor: 0.5    # Charge if current price is <= (highest_future_price * this_factor).
-    cheaper_price_delta: 0.08        # (€) Don't charge if a price at least this much cheaper is coming soon.
-
-    # --- Rule 4: PV Curtailment & Battery Full Parameters ---
-    pv_curtailment_min_charge_power: 10 # (W) Minimum battery charge power to trigger curtailment prevention.
-    pv_curtailment_power_threshold: 100 # (W) Charge power above which the output increase is scaled.
-    pv_curtailment_increase_factor: 1.2 # Multiplier to calculate output increase.
-    pv_curtailment_min_increase_step: 50 # (W) Minimum output increase to prevent curtailment.
-    battery_full_discharge_threshold: -10 # (W) Min battery discharge to trigger output reduction when full.
-    battery_full_decrease_factor: 0.8 # Multiplier to calculate output decrease when battery is full and discharging.
-    battery_full_min_decrease_step: 20 # (W) Minimum output decrease step when battery is full.
-
-# =======================================================================================
-# SENSOR & STATE VALUES (DO NOT EDIT)
-# =======================================================================================
+    output_min_limit: -1200
+    output_max_limit: 1200
+    battery_full_threshold: 93
+    grid_power_deadzone: 10
+    grid_power_threshold: 50
+    step_factor_high: 1
+    step_factor_low: 0.5
+    grid_follow_min_step: 10
+    no_feed_in_price_threshold: 0.05
+    grid_charge_price_factor: 0.5
+    cheaper_price_delta: 0.08
+    pv_curtailment_min_charge_power: 10
+    pv_curtailment_power_threshold: 100
+    pv_curtailment_increase_factor: 1.2
+    pv_curtailment_min_increase_step: 50
+    battery_full_discharge_threshold: -10
+    battery_full_decrease_factor: 0.8
+    battery_full_min_decrease_step: 20
   grid_power: "{{ states(entities.grid_power) | float(0) }}"
   battery_soc: "{{ states(entities.battery_soc) | float(0) }}"
   battery_power: "{{ states(entities.battery_power) | float(0) }}"
   current_output: "{{ states(entities.inverter_output_control) | float(0) }}"
   price_list: "{{ state_attr(entities.price_data, 'data') }}"
   current_hour_price: >-
-    {% set this_hour_iso = now().replace(minute=0, second=0, microsecond=0).isoformat() %}
-    {% set price_data = state_attr(entities.price_data, 'data') | default([]) %}
-    {% set current_price_item = price_data | selectattr('start_time', 'eq', this_hour_iso) | first %}
-    {{ current_price_item.price_per_kwh | float(999) if current_price_item else 999 }}
+    {% set this_hour_iso = now().replace(minute=0, second=0,
+    microsecond=0).isoformat() %} {% set price_data =
+    state_attr(entities.price_data, 'data') | default([]) %} {% set
+    current_price_item = price_data | selectattr('start_time', 'eq',
+    this_hour_iso) | first %} {{ current_price_item.price_per_kwh | float(999)
+    if current_price_item else 999 }}
   future_prices: >-
-    {% set now_iso = now().isoformat() %}
-    {% set price_data = state_attr(entities.price_data, 'data') | default([]) %}
-    {{ price_data | selectattr('start_time', '>=', now_iso) | map(attribute='price_per_kwh') | list }}
+    {% set now_iso = now().isoformat() %} {% set price_data =
+    state_attr(entities.price_data, 'data') | default([]) %} {{ price_data |
+    selectattr('start_time', '>=', now_iso) | map(attribute='price_per_kwh') |
+    list }}
   highest_future_price: "{{ (future_prices | max) if future_prices else 999 }}"
-  # SOC LEVELS: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
   hourly_soc_threshold: >-
-    {% set soc_levels = [45, 40, 35, 30, 25, 20, 15, 15, 15, 15, 30, 40, 50, 60, 65, 70, 75, 80, 75, 70, 65, 60, 55, 50] %}
-    {% set current_hour = now().hour %}
-    {{ soc_levels[current_hour] }}
-  # Look 12 hours into the future for a cheaper price
+    {% set soc_levels = [45, 40, 35, 30, 25, 20, 15, 15, 15, 15, 30, 40, 50, 60,
+    65, 70, 75, 80, 75, 70, 65, 60, 55, 50] %} {% set current_hour = now().hour
+    %} {{ soc_levels[current_hour] }}
   prices_in_next_12h: >-
-    {% set now_iso = now().isoformat() %}
-    {% set end_of_window_iso = (now() + timedelta(hours=12)).isoformat() %}
-    {% set price_data = state_attr(entities.price_data, 'data') | default([]) %}
-    {{ price_data | selectattr('start_time', '>', now_iso)
+    {% set now_iso = now().isoformat() %} {% set end_of_window_iso = (now() +
+    timedelta(hours=12)).isoformat() %} {% set price_data =
+    state_attr(entities.price_data, 'data') | default([]) %} {{ price_data |
+    selectattr('start_time', '>', now_iso)
                  | selectattr('start_time', '<=', end_of_window_iso)
                  | map(attribute='price_per_kwh') | list }}
   min_price_in_next_12h: "{{ (prices_in_next_12h | min) if prices_in_next_12h else 999 }}"
-  is_cheaper_price_soon: "{{ min_price_in_next_12h <= (current_hour_price - constants.cheaper_price_delta) }}"
-
-# =======================================================================================
-# RULE CONDITIONS (DO NOT EDIT)
-# =======================================================================================
+  is_cheaper_price_soon: >-
+    {{ min_price_in_next_12h <= (current_hour_price -
+    constants.cheaper_price_delta) }}
   rule_suppress_feed_in_condition: "{{ current_hour_price < constants.no_feed_in_price_threshold }}"
-  rule_pv_curtailment_condition: >-
+  rule_pv_curtailment_condition: |-
     {{ battery_soc >= constants.battery_full_threshold and
        battery_power > constants.pv_curtailment_min_charge_power and
        current_output < constants.output_max_limit and
        current_hour_price >= constants.no_feed_in_price_threshold }}
-  rule_battery_full_discharging_condition: >-
+  rule_battery_full_discharging_condition: |-
     {{ battery_soc >= constants.battery_full_threshold and
        battery_power < constants.battery_full_discharge_threshold and
        current_output > constants.output_min_limit }}
-  rule_charge_from_grid_condition: >-
+  rule_charge_from_grid_condition: |-
     {{ battery_soc < hourly_soc_threshold and
        current_hour_price <= (highest_future_price * constants.grid_charge_price_factor) and
        current_hour_price >= constants.no_feed_in_price_threshold and
        not is_cheaper_price_soon }}
-
-# =======================================================================================
-# AUTOMATION LOGIC
-# =======================================================================================
 mode: single
 max_exceeded: silent
-trigger:
-  - platform: state
-    # FIXED: Using the literal entity ID string from the 'entities' variable to avoid YAML malformed error
-    entity_id: sensor.shrdzm_485519e15aae_16_7_0 
-
-action:
-  - choose:
-      # --- RULE 2: Suppress Grid Feed-in (Highest Priority) ---
-    - conditions:
-        - condition: template
-          value_template: "{{ rule_suppress_feed_in_condition }}"
-      sequence:
-        - service: number.set_value
-          target:
-            entity_id: "{{ entities.inverter_output_control }}"
-          data:
-            value: 0
-        - service: input_text.set_value
-          target:
-            entity_id: "{{ entities.active_rule }}"
-          data:
-            value: "Rule 2: Suppress Grid Feed-in"
-        - service: input_text.set_value
-          target:
-            entity_id: "{{ entities.status_message }}"
-          data:
-            value: >
-              Price {{ current_hour_price }}€ is below threshold ({{
-              constants.no_feed_in_price_threshold }}€). Feed-in suppressed.
-
-      # --- RULE 4: PV Curtailment Prevention ---
-    - conditions:
-        - condition: template
-          value_template: "{{ rule_pv_curtailment_condition }}"
-      sequence:
-        - variables:
-            output_increase: >-
-              {% if battery_power > constants.pv_curtailment_power_threshold %}
-                {{ (battery_power * constants.pv_curtailment_increase_factor) | round(0) }}
-              {% else %}
-                {{ constants.pv_curtailment_min_increase_step }}
-              {% endif %}
-            new_output: "{{ [current_output + output_increase, constants.output_max_limit] | min }}"
-        - service: number.set_value
-          target:
-            entity_id: "{{ entities.inverter_output_control }}"
-          data:
-            value: "{{ new_output }}"
-        - service: input_text.set_value
-          target:
-            entity_id: "{{ entities.active_rule }}"
-          data:
-            value: "Rule 4: PV Curtailment Prevention - Increasing Output"
-        - service: input_text.set_value
-          target:
-            entity_id: "{{ entities.status_message }}"
-          data:
-            value: >
-              Battery full ({{ battery_soc }}%), charging at {{ battery_power
-              }}W. Increasing output to {{ new_output }}W to prevent PV
-              curtailment.
-
-      # --- RULE 4: Battery Full Optimization ---
-    - conditions:
-        - condition: template
-          value_template: "{{ rule_battery_full_discharging_condition }}"
-      sequence:
-        - variables:
-            output_decrease: "{{ [(battery_power | abs * constants.battery_full_decrease_factor) | round(0), constants.battery_full_min_decrease_step] | max }}"
-            new_output: "{{ [current_output - output_decrease, constants.output_min_limit] | max }}"
-        - service: number.set_value
-          target:
-            entity_id: "{{ entities.inverter_output_control }}"
-          data:
-            value: "{{ new_output }}"
-        - service: input_text.set_value
-          target:
-            entity_id: "{{ entities.active_rule }}"
-          data:
-            value: "Rule 4: Battery Full - Optimizing Output"
-        - service: input_text.set_value
-          target:
-            entity_id: "{{ entities.status_message }}"
-          data:
-            value: >
-              Battery at {{ battery_soc }}% discharging {{ battery_power | abs
-              }}W. Reducing output to {{ new_output }}W to balance system.
-
-      # --- RULE 3: Aggressive Grid Charging (UNMODIFIED) ---
-    - conditions:
-        - condition: template
-          value_template: "{{ rule_charge_from_grid_condition }}"
-      sequence:
-        - service: number.set_value
-          target:
-            entity_id: "{{ entities.inverter_output_control }}"
-          data:
-            value: "{{ constants.output_min_limit }}"
-        - service: input_text.set_value
-          target:
-            entity_id: "{{ entities.active_rule }}"
-          data:
-            value: "Rule 3: Aggressive Grid Charging"
-        - service: input_text.set_value
-          target:
-            entity_id: "{{ entities.status_message }}"
-          data:
-            value: >
-              Optimal price ({{ current_hour_price }}€ < {{ (highest_future_price * constants.grid_charge_price_factor) | round(3) }}€).
-              Charging from grid at max power. SOC: {{ battery_soc }}% < {{ hourly_soc_threshold }}%.
-
-    # --- RULE 1: Default Grid Following Behavior (FIXED CONDITIONS) ---
-    default:
-      - choose:
-          # --- Condition: Importing from Grid ---
-          - conditions:
-              - condition: template
-                value_template: "{{ grid_power > constants.grid_power_deadzone }}"
-            sequence:
-              - variables:
-                  step: >-
-                    {% set power_abs = grid_power | abs %}
-                    {% set step_factor = constants.step_factor_high if power_abs > constants.grid_power_threshold else constants.step_factor_low %}
-                    {{ [(power_abs * step_factor) | round(0), constants.grid_follow_min_step] | max }}
-                  new_output: "{{ [current_output + step, constants.output_max_limit] | min }}"
-              - service: number.set_value
-                target:
-                  entity_id: "{{ entities.inverter_output_control }}"
-                data:
-                  value: "{{ new_output }}"
-              - service: input_text.set_value
-                target:
-                  entity_id: "{{ entities.active_rule }}"
-                data:
-                  value: "Rule 1: Grid Follow - Reducing Import"
-              - service: input_text.set_value
-                target:
-                  entity_id: "{{ entities.status_message }}"
-                data:
-                  value: >-
-                    Importing {{ grid_power }}W from grid. Increasing output by
-                    {{ step }}W to {{ new_output }}W.
-
-          # --- Condition: Exporting to Grid ---
-          - conditions:
-              - condition: template
-                value_template: "{{ grid_power < -constants.grid_power_deadzone }}"
-            sequence:
-              - variables:
-                  step: >-
-                    {% set power_abs = grid_power | abs %}
-                    {% set step_factor = constants.step_factor_high if power_abs > constants.grid_power_threshold else constants.step_factor_low %}
-                    {{ [(power_abs * step_factor) | round(0), constants.grid_follow_min_step] | max }}
-                  new_output: "{{ [current_output - step, constants.output_min_limit] | max }}"
-              - service: number.set_value
-                target:
-                  entity_id: "{{ entities.inverter_output_control }}"
-                data:
-                  value: "{{ new_output }}"
-              - service: input_text.set_value
-                target:
-                  entity_id: "{{ entities.active_rule }}"
-                data:
-                  value: "Rule 1: Grid Follow - Reducing Export"
-              - service: input_text.set_value
-                target:
-                  entity_id: "{{ entities.status_message }}"
-                data:
-                  value: >-
-                    Exporting {{ grid_power | abs }}W to grid. Decreasing output
-                    by {{ step }}W to {{ new_output }}W.
-
-          # --- Condition: Grid is Balanced ---
-          - conditions:
-              - condition: template
-                value_template: "{{ grid_power >= -constants.grid_power_deadzone and grid_power <= constants.grid_power_deadzone }}"
-            sequence:
-              - service: input_text.set_value
-                target:
-                  entity_id: "{{ entities.active_rule }}"
-                data:
-                  value: "Rule 1: Grid Balanced"
-              - service: input_text.set_value
-                target:
-                  entity_id: "{{ entities.status_message }}"
-                data:
-                  value: >-
-                    Grid balanced at {{ grid_power }}W. Output stable at {{
-                    current_output }}W.
