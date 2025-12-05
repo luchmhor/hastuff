@@ -27,11 +27,11 @@ triggers:
     trigger: state
   
   # Trigger when electricity price data updates
-  - entity_id: sensor.epex_spot_data_price
+  - entity_id: sensor.epex_spot_data_total_price
     trigger: state
   
   # Periodic trigger every 5 minutes for continuous monitoring
-  - minutes: /5
+  - minutes: /1
     trigger: time_pattern
 
 # ==============================================================================
@@ -194,13 +194,13 @@ variables:
   # Array indexed by hour (0-23): [35, 30, 30, ...]
   # ----------------------------------------------------------------------------
   soc_threshold_by_hour: >-
-    {% set soc_levels = [
-      35, 30, 30, 30, 25, 20,  # Hours 0-5:   Night (low targets)
-      15, 15, 15, 15, 30, 40,  # Hours 6-11:  Morning ramp-up
-      50, 60, 65, 70, 75, 80,  # Hours 12-17: Afternoon/Evening (high targets)
-      60, 50, 45, 40, 35, 35   # Hours 18-23: Evening wind-down
-    ] %}
-    {{ soc_levels[now().hour] }}
+      {% set soc_levels = [
+        35, 30, 30, 30, 25, 20,
+        15, 15, 15, 15, 30, 40,
+        50, 60, 65, 70, 75, 80,
+        60, 50, 45, 40, 35, 35
+      ] %}
+      {{ soc_levels[now().hour] }}
 
   # ----------------------------------------------------------------------------
   # FUTURE PRICE ANALYSIS
