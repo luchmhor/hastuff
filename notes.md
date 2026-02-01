@@ -8,10 +8,13 @@ Create a HA automation using the Entities and Constants below:
   adjust the inverter_output to keep the grid_power within the grid_power_deadzone (plus and minus)
 
 - Rule #2 - Prevent PV Curtailment
-  IF the battery is full (battery_full_threshold) AND the grid_power_deadzone is met TRY:
-    - increase the inverter_output and keep the battery_power at a discharge level of battery_discharge_curtail.
+  IF the battery is full (battery_full_threshold) AND the grid_power_deadzone is met DO:
+    - increase the inverter_output and keep the battery_power at a discharge of battery_discharge_curtail.
   # reasoning behind that: the inverter curtails PV production (if we apply rule #1 AND battery is full AND grid_power is already met)
 
+- Rule #3 - Charge Battery if PV Production is insufficient, and prices are cheap
+  IF the battery is empty / not charged 
+  
 
 ## Entities and Constants
 
@@ -28,8 +31,29 @@ Create a HA automation using the Entities and Constants below:
   # Inverter output control (adjustable power output with the limits defined below)
   inverter_output: number.apsystems_ezhi_max_output_power
     
-  # EPEX Spot price data sensor (15-minute interval pricing)
+  # EPEX Spot price data sensor
+  ## data in 15-minute interval pricing
+  ## ahead for the current day, after about 5pm also for the next day
   price_data: sensor.epex_spot_data_price
+     - start_time: '2026-01-27T00:00:00+01:00'
+       end_time: '2026-01-27T00:15:00+01:00'
+       price_per_kwh: 0.165648
+     - start_time: '2026-01-27T00:15:00+01:00'
+       end_time: '2026-01-27T00:30:00+01:00'
+       price_per_kwh: 0.162612
+     - start_time: '2026-01-27T00:30:00+01:00'
+       end_time: '2026-01-27T00:45:00+01:00'
+       price_per_kwh: 0.162768
+
+  # Appartment Consumption
+  ## the consumption of the apartment is available through influxdb
+  ## the consumption is essentially grid_power - inverter_output
+  host: localhost
+  port: 8086
+  database: homeassistant
+  username: homeassistant
+  password: hainflux!
+  entity: total_consumption
   
 ### Constants
   # Minimum inverter output power in Watts (negative = grid charging)
