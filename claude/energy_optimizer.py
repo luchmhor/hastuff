@@ -1,426 +1,353 @@
-# appdaemon/apps/energy_optimizer.py
+# pyscript/energy_optimizer.py
 """
-EnergyOptimizer — AppDaemon app for Home Assistant
-Minimizes electricity cost by controlling APsystems EzHi inverter output
-based on historical apartment load, Solcast solar forecast, and EPEX spot prices.
+Energy Optimizer — pyscript (HACS) version
 
-Cycle: every 15 minutes
-Horizon: 96 slots (24 h)
+Two-layer control architecture:
+  Strategic (15 min): InfluxDB history + Solcast + EPEX → operating MODE + guidance setpoint
+  Tactical   (5 sec): real-time proportional controller targeting grid_power ≈ 0
+
+Requires in configuration.yaml:
+  pyscript:
+    allow_all_imports: true
 """
 
-import appdaemon.plugins.hass.hassapi as hass
-from datetime import datetime, timedelta
-import pytz
+import requests
 import statistics
+import pytz
+from datetime import datetime, timedelta
 
-try:
-    from influxdb import InfluxDBClient
-    INFLUX_AVAILABLE = True
-except ImportError:
-    INFLUX_AVAILABLE = False
+# ── Hardware constants ────────────────────────────────────────────────────
+BATTERY_SIZE_WH   = 2760
+OUTPUT_MIN_W      = -1200    # negative = grid charging battery
+OUTPUT_MAX_W      =  1200    # positive = discharge to home / export to grid
+BATTERY_FULL_PCT  =  98
+BATTERY_EMPTY_PCT =  15
+GRID_DEADZONE_W   =  10
+
+# ── InfluxDB (HTTP API — no external package needed) ─────────────────────
+INFLUX_URL    = "http://localhost:8086/query"
+INFLUX_DB     = "homeassistant"
+INFLUX_USER   = "homeassistant"
+INFLUX_PASS   = "hainflux!"
+INFLUX_ENTITY = "total_consumption"
+INFLUX_UNIT   = "W"            # InfluxDB measurement = HA unit; change to "kW" if needed
+
+# ── Real-time proportional controller tuning ─────────────────────────────
+RT_GAIN      = 0.8   # fraction of grid_power error applied per 5-sec step
+RT_ROUND_W   = 10    # round setpoint to nearest N watts to reduce chatter
+RT_MIN_DELTA = 10    # minimum W change before writing to HA (avoids spam)
+
+# ── HA entity IDs ─────────────────────────────────────────────────────────
+E_GRID_POWER     = "sensor.shrdzm_485519e15aae_16_7_0"
+E_BATTERY_SOC    = "sensor.ezhi_battery_state_of_charge"
+E_BATTERY_POWER  = "sensor.ezhi_battery_power"
+E_INV_OUTPUT     = "number.apsystems_ezhi_max_output_power"
+E_PRICE_DATA     = "sensor.epex_spot_data_price"
+E_SOLAR_HOUR     = "sensor.solcast_pv_forecast_forecast_next_hour"
+E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
+
+# ── Shared state between strategic and tactical layers ────────────────────
+# Module-level dict; both trigger functions read/write this.
+_ctx = {
+    "mode":         "BALANCE",   # GRID_CHARGE | DISCHARGE | EXPORT | BALANCE
+    "setpoint":     0,           # last setpoint written to HA (W)
+    "strategic_sp": 0,           # guidance setpoint from strategic layer
+    "price":        0.15,        # current 15-min slot price
+    "p25":          0.10,        # lower price percentile (24 h horizon)
+    "p75":          0.20,        # upper price percentile (24 h horizon)
+    "last_soc":     50.0,        # cached SOC for tactical layer fallback
+}
+
+TZ = pytz.timezone("Europe/Vienna")
 
 
-class EnergyOptimizer(hass.Hass):
+# ════════════════════════════════════════════════════════════════════════════
+# LOW-LEVEL HELPERS
+# ════════════════════════════════════════════════════════════════════════════
 
-    TZ = pytz.timezone("Europe/Vienna")
+def _influx_query(q: str) -> dict:
+    """
+    Blocking InfluxDB HTTP request.
+    Must always be called via task.executor() to avoid blocking HA's event loop.
+    """
+    resp = requests.get(
+        INFLUX_URL,
+        params={"db": INFLUX_DB, "u": INFLUX_USER, "p": INFLUX_PASS, "q": q},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
-    # ── Hardware constants ──────────────────────────────────────────────
-    BATTERY_SIZE_WH   = 2760
-    OUTPUT_MIN_W      = -1200    # negative = pull from grid (charge battery)
-    OUTPUT_MAX_W      =  1200    # positive = push to grid/home (discharge battery)
-    BATTERY_FULL_PCT  =  98
-    BATTERY_EMPTY_PCT =  15
-    GRID_DEADZONE_W   =  10
 
-    # ── HA entity IDs ────────────────────────────────────────────────────
-    E_GRID_POWER     = "sensor.shrdzm_485519e15aae_16_7_0"
-    E_BATTERY_SOC    = "sensor.ezhi_battery_state_of_charge"
-    E_BATTERY_POWER  = "sensor.ezhi_battery_power"
-    E_INV_OUTPUT     = "number.apsystems_ezhi_max_output_power"
-    E_PRICE_DATA     = "sensor.epex_spot_data_price"
-    E_SOLAR_HOUR     = "sensor.solcast_pv_forecast_forecast_next_hour"
-    E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
+def _fetch_historical_consumption() -> dict:
+    """
+    Blocking function: queries InfluxDB for the past 4 same-weekday full days.
+    Returns {(hour, quarter_idx 0–3): mean_watts}.
+    Called via task.executor() from strategic_optimize().
+    """
+    now   = datetime.now(TZ)
+    accum = {}   # {(h, q): [watt_samples_across_4_weeks]}
 
-    # ── InfluxDB ──────────────────────────────────────────────────────────
-    INFLUX_HOST   = "localhost"
-    INFLUX_PORT   = 8086
-    INFLUX_DB     = "homeassistant"
-    INFLUX_USER   = "homeassistant"
-    INFLUX_PASS   = "hainflux!"
-    INFLUX_ENTITY = "total_consumption"
-    # InfluxDB measurement name = HA unit of measurement.
-    # Change to "kW" if your total_consumption sensor reports in kW.
-    INFLUX_UNIT   = "W"
+    for week_back in range(1, 5):
+        anchor    = now - timedelta(weeks=week_back)
+        day_start = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end   = day_start + timedelta(days=1)
+        s_utc     = day_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        e_utc     = day_end.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    INTERVAL_SEC  = 15 * 60     # run every 15 minutes
-    HORIZON_SLOTS = 96          # 24 h × 4 slots/h
-
-    # ════════════════════════════════════════════════════════════════════
-    # LIFECYCLE
-    # ════════════════════════════════════════════════════════════════════
-
-    def initialize(self):
-        self.log("EnergyOptimizer ▶ starting up")
-
-        self._influx = None
-        if INFLUX_AVAILABLE:
-            try:
-                self._influx = InfluxDBClient(
-                    host=self.INFLUX_HOST,
-                    port=self.INFLUX_PORT,
-                    database=self.INFLUX_DB,
-                    username=self.INFLUX_USER,
-                    password=self.INFLUX_PASS,
-                )
-                self._influx.ping()
-                self.log("InfluxDB ✓ connected")
-            except Exception as exc:
-                self.log(
-                    f"InfluxDB connection failed ({exc}) — fallback profile active",
-                    level="WARNING",
-                )
-                self._influx = None
-        else:
-            self.log("influxdb-python not installed — fallback profile active", level="WARNING")
-
-        # Register the 15-min cycle. "now" fires the first run immediately.
-        self.run_every(self._run_cycle, "now", self.INTERVAL_SEC)
-        self.log("EnergyOptimizer ✓ initialized")
-
-    # ════════════════════════════════════════════════════════════════════
-    # MAIN CYCLE
-    # ════════════════════════════════════════════════════════════════════
-
-    def _run_cycle(self, kwargs):
-        self.log("── optimization cycle start ──")
-        try:
-            soc = self._read_soc()
-            if soc is None:
-                self.log("Battery SOC unavailable — skipping cycle", level="WARNING")
-                return
-
-            consumption = self._get_historical_consumption()
-            solar       = self._get_solar_forecast()
-            prices      = self._get_spot_prices()
-
-            if not prices:
-                self.log("No EPEX price data available — skipping cycle", level="WARNING")
-                return
-
-            schedule = self._build_schedule(consumption, solar, prices)
-            setpoint = self._dispatch(soc, schedule)
-            self._apply_setpoint(setpoint)
-
-        except Exception as exc:
-            import traceback
-            self.log(
-                f"Cycle error: {exc}\n{traceback.format_exc()}",
-                level="ERROR",
-            )
-
-    # ════════════════════════════════════════════════════════════════════
-    # DATA RETRIEVAL
-    # ════════════════════════════════════════════════════════════════════
-
-    def _read_soc(self):
-        raw = self.get_state(self.E_BATTERY_SOC)
-        if raw in (None, "unavailable", "unknown"):
-            return None
-        try:
-            return float(raw)
-        except ValueError:
-            return None
-
-    # ── 1. Historical consumption (InfluxDB) ─────────────────────────
-
-    def _get_historical_consumption(self):
-        """
-        Query InfluxDB for the past 4 occurrences of today's weekday (full day each).
-        Returns {(hour, quarter_idx): mean_watts} — 96 keys max.
-
-        InfluxDB stores HA data with:
-          measurement = unit of measurement (e.g. "W")
-          tag entity_id = HA entity ID
-          field value   = sensor reading
-        """
-        if self._influx is None:
-            return self._fallback_consumption()
-
-        now   = datetime.now(self.TZ)
-        accum = {}  # {(h, q): [watt_samples]}
-
-        for week_back in range(1, 5):
-            anchor    = now - timedelta(weeks=week_back)
-            day_start = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
-            day_end   = day_start + timedelta(days=1)
-
-            start_utc = day_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            end_utc   = day_end.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            query = (
-                f'SELECT mean("value") FROM "{self.INFLUX_UNIT}" '
-                f'WHERE "entity_id" = \'{self.INFLUX_ENTITY}\' '
-                f"AND time >= '{start_utc}' AND time < '{end_utc}' "
-                f"GROUP BY time(15m) fill(previous)"
-            )
-            try:
-                for pt in self._influx.query(query).get_points():
-                    if pt.get("mean") is None:
-                        continue
-                    t_local = datetime.fromisoformat(
-                        pt["time"].replace("Z", "+00:00")
-                    ).astimezone(self.TZ)
-                    key = (t_local.hour, t_local.minute // 15)
-                    accum.setdefault(key, []).append(pt["mean"])
-            except Exception as exc:
-                self.log(
-                    f"InfluxDB query error (week -{week_back}): {exc}",
-                    level="ERROR",
-                )
-
-        if not accum:
-            self.log("No InfluxDB data returned — using fallback profile", level="WARNING")
-            return self._fallback_consumption()
-
-        result = {k: statistics.mean(v) for k, v in accum.items()}
-        self.log(
-            f"Consumption profile loaded: {len(result)} slots from "
-            f"{sum(len(v) for v in accum.values())} data points"
+        q = (
+            f'SELECT mean("value") FROM "{INFLUX_UNIT}" '
+            f"WHERE \"entity_id\" = '{INFLUX_ENTITY}' "
+            f"AND time >= '{s_utc}' AND time < '{e_utc}' "
+            f"GROUP BY time(15m) fill(previous)"
         )
-        return result
+        try:
+            data   = _influx_query(q)
+            series = data.get("results", [{}])[0].get("series", [])
+            if not series:
+                continue
+            cols     = series[0]["columns"]
+            t_idx    = cols.index("time")
+            mean_idx = cols.index("mean")
+            for row in series[0].get("values", []):
+                if row[mean_idx] is None:
+                    continue
+                t_local = datetime.fromisoformat(
+                    row[t_idx].replace("Z", "+00:00")
+                ).astimezone(TZ)
+                key = (t_local.hour, t_local.minute // 15)
+                accum.setdefault(key, []).append(row[mean_idx])
+        except Exception as exc:
+            log.warning(f"InfluxDB query error (week -{week_back}): {exc}")
 
-    @staticmethod
-    def _fallback_consumption():
-        """Rough 24 h load curve (W) used when InfluxDB is unreachable."""
-        hourly = (
-            [150] * 6 +   # 00–06  night
-            [600] * 3 +   # 06–09  morning peak
-            [350] * 8 +   # 09–17  daytime
-            [700] * 5 +   # 17–22  evening peak
-            [300] * 2     # 22–24  late evening
+    if not accum:
+        log.warning("No InfluxDB data — using fallback consumption profile")
+        return _fallback_consumption()
+
+    return {k: statistics.mean(v) for k, v in accum.items()}
+
+
+def _fallback_consumption() -> dict:
+    """Rough 24 h load profile (W) when InfluxDB is unavailable."""
+    hourly = [150]*6 + [600]*3 + [350]*8 + [700]*5 + [300]*2
+    return {(h, q): hourly[h] for h in range(24) for q in range(4)}
+
+
+def _get_solar_forecast() -> dict:
+    """
+    Returns {hour: mean_watts} from Solcast sensor attributes.
+    pv_estimate is mean kW over a 30-min period; accumulate per hour → /4 per 15-min slot.
+    """
+    solar = {}
+    try:
+        attrs = state.getattr(E_SOLAR_HOUR) or {}
+        fl    = (
+            attrs.get("forecast") or
+            attrs.get("detailedForecast") or
+            attrs.get("DetailedForecast") or
+            attrs.get("forecasts") or
+            []
         )
-        return {(h, q): hourly[h] for h in range(24) for q in range(4)}
+        for entry in fl:
+            t_str = entry.get("period_start") or entry.get("PeriodStart")
+            pv_kw = float(entry.get("pv_estimate") or entry.get("PvEstimate") or 0)
+            if t_str:
+                t = datetime.fromisoformat(t_str).astimezone(TZ)
+                solar[t.hour] = solar.get(t.hour, 0.0) + pv_kw * 1000
+        if not solar:
+            # Scalar fallback: sensor state = Wh for the next hour = average W for 60 min
+            val = float(state.get(E_SOLAR_HOUR) or 0)
+            solar[datetime.now(TZ).hour] = val
+    except Exception as exc:
+        log.warning(f"Solar forecast error: {exc}")
+    return solar
 
-    # ── 2. Solar forecast (Solcast) ──────────────────────────────────
 
-    def _get_solar_forecast(self):
-        """
-        Returns {hour: mean_watts} for the next 24 hours.
+def _get_spot_prices() -> dict:
+    """Returns {(hour, quarter_idx): EUR/kWh} from EPEX sensor attribute 'data'."""
+    prices = {}
+    try:
+        data = (state.getattr(E_PRICE_DATA) or {}).get("data", [])
+        for entry in data:
+            t = datetime.fromisoformat(entry["start_time"]).astimezone(TZ)
+            prices[(t.hour, t.minute // 15)] = float(entry["price_per_kwh"])
+    except Exception as exc:
+        log.error(f"Spot price error: {exc}")
+    return prices
 
-        Preferred path: `forecast` attribute list from the Solcast integration.
-          Each entry: {"period_start": "<ISO>", "pv_estimate": <kW mean over 30 min>}
-          Entries are 30-min blocks; we accumulate into hourly buckets → divide by 4
-          at schedule-build time to get average W per 15-min slot.
 
-        Fallback: scalar state of sensor.solcast_pv_forecast_forecast_next_hour
-          The BJReplay Solcast integration reports this in Wh for the next 60 min.
-        """
-        solar = {}
-        try:
-            state = self.get_state(self.E_SOLAR_HOUR, attribute="all") or {}
-            attrs = state.get("attributes", {})
+def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
+    """
+    Assembles 96 forward-looking 15-min slots from the current timestamp.
+    net_load > 0 → apartment needs power from battery/grid
+    net_load < 0 → solar surplus, can charge battery or export
+    """
+    now = datetime.now(TZ)
+    out = []
+    for i in range(96):
+        t   = now + timedelta(minutes=15 * i)
+        key = (t.hour, t.minute // 15)
+        c   = consumption.get(key, 300.0)
+        s   = solar.get(t.hour, 0.0) / 4.0   # hourly W → 15-min average W
+        p   = prices.get(key, 0.15)
+        out.append({
+            "i": i, "time": t,
+            "cons": c, "solar": s, "price": p,
+            "net": c - s,
+        })
+    return out
 
-            # Try known attribute names across Solcast integration versions
-            forecast_list = (
-                attrs.get("forecast") or
-                attrs.get("detailedForecast") or
-                attrs.get("DetailedForecast") or
-                attrs.get("forecasts") or
-                []
-            )
 
-            if forecast_list:
-                for entry in forecast_list:
-                    t_str = (
-                        entry.get("period_start") or
-                        entry.get("PeriodStart") or
-                        entry.get("period")
-                    )
-                    pv_kw = float(
-                        entry.get("pv_estimate") or
-                        entry.get("PvEstimate") or 0
-                    )
-                    if not t_str:
-                        continue
-                    t = datetime.fromisoformat(t_str).astimezone(self.TZ)
-                    # pv_estimate = mean kW over the 30-min period
-                    # Accumulate W per hour (two 30-min blocks per hour)
-                    solar[t.hour] = solar.get(t.hour, 0.0) + pv_kw * 1000
-                self.log(f"Solar forecast loaded: {len(solar)} hours from attributes")
-                return solar
+def _compute_mode(soc: float, schedule: list) -> tuple:
+    """
+    Determines operating mode and strategic setpoint from price percentiles.
+    Returns (mode_str, setpoint_W, p25, p75).
 
-            # Scalar fallback — only covers the next hour
-            next_hour_wh = float(state.get("state") or 0)
-            now = datetime.now(self.TZ)
-            # Wh for 60 min = average W for 60 min
-            solar[now.hour] = next_hour_wh
-            self.log(
-                f"Solcast: no detailed attributes found — scalar fallback "
-                f"({next_hour_wh:.0f} Wh next hour only)",
-                level="WARNING",
-            )
+    Modes:
+      GRID_CHARGE  — draw from grid to charge battery (cheap period or SOC critical)
+      DISCHARGE    — maximize battery discharge (expensive period)
+      EXPORT       — max output when battery full and price positive
+      BALANCE      — proportional self-consumption (tactical layer takes over)
+    """
+    if not schedule:
+        return "BALANCE", 0, 0.10, 0.20
 
-        except Exception as exc:
-            self.log(f"Solar forecast error: {exc}", level="WARNING")
+    prices_sorted = sorted(s["price"] for s in schedule)
+    n   = len(prices_sorted)
+    p25 = prices_sorted[max(0, int(n * 0.25) - 1)]
+    p75 = prices_sorted[min(n - 1, int(n * 0.75))]
 
-        return solar
+    price = schedule[0]["price"]
+    net   = schedule[0]["net"]
 
-    # ── 3. EPEX Spot prices ───────────────────────────────────────────
+    if soc <= BATTERY_EMPTY_PCT:
+        return ("GRID_CHARGE", OUTPUT_MIN_W, p25, p75) if price <= p25 \
+               else ("BALANCE", 0, p25, p75)
+    elif soc >= BATTERY_FULL_PCT:
+        return ("EXPORT", OUTPUT_MAX_W, p25, p75) if price > 0 \
+               else ("BALANCE", max(0, int(net)), p25, p75)
+    elif price >= p75:
+        return "DISCHARGE", OUTPUT_MAX_W, p25, p75
+    elif price <= p25:
+        return "GRID_CHARGE", OUTPUT_MIN_W, p25, p75
+    else:
+        return "BALANCE", int(net), p25, p75
 
-    def _get_spot_prices(self):
-        """
-        Returns {(hour, quarter): price_eur_per_kwh} from the EPEX sensor.
 
-        The sensor attribute `data` is a list of:
-          {start_time: "<ISO>", end_time: "<ISO>", price_per_kwh: <float>}
-        Available for today; after ~17:00 also for tomorrow.
-        """
-        prices = {}
-        try:
-            state = self.get_state(self.E_PRICE_DATA, attribute="all") or {}
-            data  = state.get("attributes", {}).get("data", [])
-            for entry in data:
-                t = datetime.fromisoformat(entry["start_time"]).astimezone(self.TZ)
-                prices[(t.hour, t.minute // 15)] = float(entry["price_per_kwh"])
-            self.log(f"Prices loaded: {len(prices)} slots")
-        except Exception as exc:
-            self.log(f"Spot price error: {exc}", level="ERROR")
-        return prices
+def _apply_if_changed(new_sp: int):
+    """Write setpoint to HA only when it differs by ≥ RT_MIN_DELTA W."""
+    new_sp  = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, new_sp))
+    current = _ctx["setpoint"]
+    if abs(new_sp - current) >= RT_MIN_DELTA:
+        number.set_value(entity_id=E_INV_OUTPUT, value=new_sp)
+        _ctx["setpoint"] = new_sp
+        log.debug(f"⚡ inverter {current:+d} W → {new_sp:+d} W")
 
-    # ════════════════════════════════════════════════════════════════════
-    # SCHEDULE ASSEMBLY
-    # ════════════════════════════════════════════════════════════════════
 
-    def _build_schedule(self, consumption, solar, prices):
-        """
-        Assembles 96 forward-looking slots (current timestamp → +24 h).
+# ════════════════════════════════════════════════════════════════════════════
+# STRATEGIC LAYER — every 15 minutes
+# Queries InfluxDB + sensors → determines MODE and guidance setpoint
+# ════════════════════════════════════════════════════════════════════════════
 
-        net_load (W) = expected apartment consumption − expected solar output
-          > 0  →  battery/grid must supply power
-          < 0  →  solar surplus, can charge battery or export
+@time_trigger("period(now, 0:15:00)")
+def strategic_optimize():
+    log.info("── Strategic optimization cycle ──")
+    try:
+        soc_raw = state.get(E_BATTERY_SOC)
+        if soc_raw in (None, "unavailable", "unknown"):
+            log.warning("Battery SOC unavailable — skipping strategic cycle")
+            return
+        soc = float(soc_raw)
+        _ctx["last_soc"] = soc
 
-        Solar stored as hourly mean-W; divide by 4 → average W per 15-min slot.
-        """
-        now      = datetime.now(self.TZ)
-        schedule = []
+        # InfluxDB is blocking I/O → must use task.executor
+        consumption = task.executor(_fetch_historical_consumption)
+        solar       = _get_solar_forecast()
+        prices      = _get_spot_prices()
 
-        for i in range(self.HORIZON_SLOTS):
-            t    = now + timedelta(minutes=15 * i)
-            key  = (t.hour, t.minute // 15)
-            c_w  = consumption.get(key, 300.0)
-            s_w  = solar.get(t.hour, 0.0) / 4.0  # hourly W → 15-min average W
-            p    = prices.get(key, 0.15)           # default 15 ct/kWh if slot unknown
+        if not prices:
+            log.warning("No EPEX price data available — mode unchanged")
+            return
 
-            schedule.append({
-                "index":       i,
-                "time":        t,
-                "consumption": c_w,
-                "solar":       s_w,
-                "price":       p,
-                "net_load":    c_w - s_w,
-            })
+        schedule                 = _build_schedule(consumption, solar, prices)
+        mode, sp, p25, p75       = _compute_mode(soc, schedule)
 
-        return schedule
+        _ctx["mode"]             = mode
+        _ctx["strategic_sp"]     = sp
+        _ctx["p25"]              = p25
+        _ctx["p75"]              = p75
+        _ctx["price"]            = schedule[0]["price"] if schedule else 0.15
 
-    # ════════════════════════════════════════════════════════════════════
-    # DISPATCH OPTIMIZER  —  greedy rolling-horizon
-    # ════════════════════════════════════════════════════════════════════
+        # For locked modes apply the setpoint immediately;
+        # BALANCE leaves fine-tuning to the 5-sec tactical layer.
+        if mode != "BALANCE":
+            _apply_if_changed(sp)
 
-    def _dispatch(self, soc: float, schedule: list) -> int:
-        """
-        Returns the integer Watt setpoint for the CURRENT 15-min slot.
-
-        Uses P25 / P75 price percentiles across the full 24 h horizon as
-        dynamic thresholds, so the strategy adapts to today's price spread.
-
-        Priority rules (evaluated top-to-bottom):
-          1. SOC ≤ BATTERY_EMPTY_PCT
-               cheap  → grid-charge  (OUTPUT_MIN_W)
-               else   → hold         (0)
-          2. SOC ≥ BATTERY_FULL_PCT
-               price > 0  → max export   (OUTPUT_MAX_W)
-               else       → cover load only
-          3. Current price ≥ P75  →  max discharge  (OUTPUT_MAX_W)
-          4. Current price ≤ P25  →  max grid-charge (OUTPUT_MIN_W)
-          5. Otherwise (self-consumption mode)
-               net_load > deadzone & battery has charge  → discharge to meet load
-               net_load < −deadzone & battery has room   → absorb solar surplus
-               else                                      → hold (0)
-        """
-        prices_sorted = sorted(s["price"] for s in schedule)
-        n   = len(prices_sorted)
-        p25 = prices_sorted[max(0, int(n * 0.25) - 1)]
-        p75 = prices_sorted[min(n - 1, int(n * 0.75))]
-
-        cur      = schedule[0]
-        price    = cur["price"]
-        net_load = cur["net_load"]
-        solar    = cur["solar"]
-
-        headroom_wh  = max(0.0, (self.BATTERY_FULL_PCT  - soc) / 100 * self.BATTERY_SIZE_WH)
-        available_wh = max(0.0, (soc - self.BATTERY_EMPTY_PCT) / 100 * self.BATTERY_SIZE_WH)
-
-        # ── Rule 1: Battery critically empty ────────────────────────────
-        if soc <= self.BATTERY_EMPTY_PCT:
-            if price <= p25:
-                sp  = self.OUTPUT_MIN_W
-                why = f"SOC {soc:.0f}% ≤ empty & price cheap → grid charge"
-            else:
-                sp  = 0
-                why = f"SOC {soc:.0f}% ≤ empty, not cheap → hold"
-
-        # ── Rule 2: Battery full ─────────────────────────────────────────
-        elif soc >= self.BATTERY_FULL_PCT:
-            if price > 0:
-                sp  = self.OUTPUT_MAX_W
-                why = f"SOC {soc:.0f}% ≥ full & price > 0 → max export"
-            else:
-                sp  = max(0, int(net_load))
-                why = f"SOC {soc:.0f}% ≥ full & price ≤ 0 → cover load only"
-
-        # ── Rule 3: Expensive period → discharge ─────────────────────────
-        elif price >= p75:
-            sp  = self.OUTPUT_MAX_W
-            why = f"Price {price:.4f} ≥ P75 {p75:.4f} → max discharge"
-
-        # ── Rule 4: Cheap period → buy / charge ──────────────────────────
-        elif price <= p25:
-            sp  = self.OUTPUT_MIN_W
-            why = f"Price {price:.4f} ≤ P25 {p25:.4f} → grid charge"
-
-        # ── Rule 5: Mid price → self-consumption ─────────────────────────
-        else:
-            if net_load > self.GRID_DEADZONE_W and available_wh > 0:
-                # Discharge just enough to cover the expected load
-                sp = min(self.OUTPUT_MAX_W, int(net_load))
-            elif net_load < -self.GRID_DEADZONE_W and headroom_wh > 0:
-                # Absorb solar surplus into battery
-                sp = max(self.OUTPUT_MIN_W, int(net_load))
-            else:
-                sp = 0
-            why = (
-                f"Price {price:.4f} mid → self-consume "
-                f"(net {net_load:+.0f} W, avail {available_wh:.0f} Wh)"
-            )
-
-        sp = max(self.OUTPUT_MIN_W, min(self.OUTPUT_MAX_W, sp))
-
-        self.log(
-            f"SOC={soc:.1f}% | P={price:.4f} €/kWh "
+        log.info(
+            f"Mode={mode} | SOC={soc:.0f}% | "
+            f"Price={_ctx['price']:.4f} €/kWh "
             f"[P25={p25:.4f} P75={p75:.4f}] | "
-            f"Net={net_load:+.0f}W Solar={solar:.0f}W | "
-            f"⚡ setpoint={sp:+d}W | {why}"
+            f"Guidance={sp:+d} W"
         )
-        return sp
 
-    # ════════════════════════════════════════════════════════════════════
-    # ACTUATOR
-    # ════════════════════════════════════════════════════════════════════
+    except Exception as exc:
+        import traceback
+        log.error(f"Strategic error: {exc}\n{traceback.format_exc()}")
 
-    def _apply_setpoint(self, setpoint: int):
-        self.call_service(
-            "number/set_value",
-            entity_id=self.E_INV_OUTPUT,
-            value=setpoint,
-        )
-        self.log(f"✓ Inverter setpoint applied: {setpoint:+d} W")
+
+# ════════════════════════════════════════════════════════════════════════════
+# TACTICAL LAYER — every 5 seconds
+# Real-time proportional control targeting grid_power ≈ 0
+# ════════════════════════════════════════════════════════════════════════════
+
+@time_trigger("period(now, 0:00:05)")
+def realtime_control():
+    """
+    Every 5 seconds:
+
+    GRID_CHARGE / DISCHARGE / EXPORT:
+      Re-applies the strategic setpoint each cycle (guards against inverter resets).
+
+    BALANCE (self-consumption):
+      Proportional controller: new_sp = current_sp + GAIN × grid_power
+        grid_power > 0  →  importing  →  increase output (discharge more / charge less)
+        grid_power < 0  →  exporting  →  decrease output (charge more / export less)
+      Setpoint is rounded to 10 W and only written to HA if change ≥ RT_MIN_DELTA W.
+    """
+    try:
+        mode = _ctx["mode"]
+
+        # ── Non-BALANCE: re-assert strategic setpoint ─────────────────────
+        if mode != "BALANCE":
+            _apply_if_changed(_ctx["strategic_sp"])
+            return
+
+        # ── BALANCE: proportional real-time control ───────────────────────
+        grid_raw = state.get(E_GRID_POWER)
+        if grid_raw in (None, "unavailable", "unknown"):
+            return
+        grid = float(grid_raw)   # W  (positive = importing, negative = exporting)
+
+        soc_raw = state.get(E_BATTERY_SOC)
+        soc     = float(soc_raw) if soc_raw not in (None, "unavailable", "unknown") \
+                  else _ctx["last_soc"]
+        _ctx["last_soc"] = soc
+
+        # Dead-zone: skip if grid is already balanced
+        if abs(grid) <= GRID_DEADZONE_W:
+            return
+
+        current_sp = _ctx["setpoint"]
+        raw_sp     = current_sp + RT_GAIN * grid
+        new_sp     = int(round(raw_sp / RT_ROUND_W) * RT_ROUND_W)
+
+        # Battery SOC safety guards
+        if new_sp > current_sp and soc <= BATTERY_EMPTY_PCT:
+            return   # cannot discharge further
+        if new_sp < current_sp and soc >= BATTERY_FULL_PCT:
+            return   # cannot charge further
+
+        _apply_if_changed(new_sp)
+
+    except Exception as exc:
+        log.error(f"Realtime control error: {exc}")
