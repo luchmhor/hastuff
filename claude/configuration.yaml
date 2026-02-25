@@ -1,4 +1,6 @@
-# configuration.yaml  — add this input_boolean for manual override
+pyscript:
+  allow_all_imports: true   # required for requests, pytz, statistics, datetime
+
 input_boolean:
   energy_optimizer_pause:
     name: Pause Energy Optimizer
