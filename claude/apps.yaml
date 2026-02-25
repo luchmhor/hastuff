@@ -1,0 +1,4 @@
+# appdaemon/apps/apps.yaml
+energy_optimizer:
+  module: energy_optimizer
+  class: EnergyOptimizer
