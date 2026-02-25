@@ -4,17 +4,10 @@ Create a HA automation using the Entities and Constants below:
 
 ## BASIC FUNCIONALITY:
 
-- Rule #1 - follow grid - baseline
-  adjust the inverter_output to keep the grid_power within the grid_power_deadzone (plus and minus)
-
-- Rule #2 - Prevent PV Curtailment
-  IF the battery is full (battery_full_threshold) AND the grid_power_deadzone is met DO:
-    - increase the inverter_output and keep the battery_power at a discharge of battery_discharge_curtail.
-  reasoning behind that: the inverter curtails PV production (if we apply rule #1 AND battery is full AND grid_power is already met)
-
-- Rule #3 - Charge Battery if PV Production is insufficient, and prices are cheap
-  IF the battery is empty / not charged 
-  
+1. take the historical data of the apartment consumption: 15min mean of the same day of the past 4 same days of the week, e.g. today is thursday, get 15min values of the past 4 thursdays from the influxdb and create 15min mean values for the day, do this from the current timestamp 24h into the future
+2. take the solar forecast for the current day by hourly values and also the total expected production for the next day
+3. take the spot prices from the current timestap 24h into the future
+4. based on 1, 2, and 3 control the current inverter output (and subsequently the battery charging, discharging) to minimize the total costs.
 
 ## Entities and Constants
 
@@ -47,7 +40,7 @@ Create a HA automation using the Entities and Constants below:
        price_per_kwh: 0.162768
   ```
   * Appartment Consumption
-  the consumption of the apartment is available through influxdb
+  past data of the total consumption of the apartment is available through influxdb
   the consumption is essentially grid_power - inverter_output
   ```
   host: localhost
@@ -57,7 +50,15 @@ Create a HA automation using the Entities and Constants below:
   password: hainflux!
   entity: total_consumption
   ```
+
+  * Solar Forecast (Solcas):
+  ** same day hourly values: `sensor.solcast_pv_forecast_forecast_next_hour`
+  ** next day total value: `sensor.solcast_pv_forecast_forecast_tomorrow`
+  
 ### Constants
+  * battery capacity (in Wh)
+  battery_size: 2760
+
   * Minimum inverter output power in Watts (negative = grid charging)
   output_min_limit: -1200
     
