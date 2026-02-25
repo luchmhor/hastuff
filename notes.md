@@ -10,7 +10,7 @@ Create a HA automation using the Entities and Constants below:
 - Rule #2 - Prevent PV Curtailment
   IF the battery is full (battery_full_threshold) AND the grid_power_deadzone is met DO:
     - increase the inverter_output and keep the battery_power at a discharge of battery_discharge_curtail.
-  # reasoning behind that: the inverter curtails PV production (if we apply rule #1 AND battery is full AND grid_power is already met)
+  reasoning behind that: the inverter curtails PV production (if we apply rule #1 AND battery is full AND grid_power is already met)
 
 - Rule #3 - Charge Battery if PV Production is insufficient, and prices are cheap
   IF the battery is empty / not charged 
