@@ -1,0 +1,33 @@
+# automations.yaml
+
+# ── Force immediate re-run when EPEX next-day prices arrive (~17:00) ──
+- alias: "Energy Optimizer - Reload on price update"
+  trigger:
+    - platform: state
+      entity_id: sensor.epex_spot_data_price
+  action:
+    - service: appdaemon.run_app
+      data:
+        app_name: energy_optimizer
+  mode: single
+  max_exceeded: silent
+
+# ── Emergency: battery critical → safe hold immediately ──
+- alias: "Energy Optimizer - Emergency battery guard"
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.ezhi_battery_state_of_charge
+      below: 12          # below BATTERY_EMPTY_PCT safety margin
+  action:
+    - service: number.set_value
+      target:
+        entity_id: number.apsystems_ezhi_max_output_power
+      data:
+        value: 0
+    - service: notify.persistent_notification
+      data:
+        title: "⚠️ Battery Critical"
+        message: >
+          Battery SOC is {{ states('sensor.ezhi_battery_state_of_charge') }}% —
+          inverter forced to 0 W. Optimizer will resume at next 15-min cycle.
+  mode: single
