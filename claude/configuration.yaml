@@ -1,0 +1,10 @@
+# configuration.yaml  — add this input_boolean for manual override
+input_boolean:
+  energy_optimizer_pause:
+    name: Pause Energy Optimizer
+    icon: mdi:pause-circle
+
+input_button:
+  energy_optimizer_retrigger:
+    name: Re-run Energy Optimizer
+    icon: mdi:refresh
