@@ -1,10 +1,14 @@
 # pyscript/energy_optimizer.py
 """
-Energy Optimizer — pyscript (HACS) version
+Energy Optimizer — pyscript (HACS)
 
-Two-layer control architecture:
+Two-layer control:
   Strategic (15 min): InfluxDB history + Solcast + EPEX → operating MODE + guidance setpoint
   Tactical   (5 sec): real-time proportional controller targeting grid_power ≈ 0
+
+Additional triggers:
+  - Re-runs strategic cycle immediately when EPEX prices update (~17:00)
+  - Emergency guard: forces inverter to 0 W if SOC drops below hard floor
 
 Requires in configuration.yaml:
   pyscript:
@@ -46,7 +50,7 @@ E_PRICE_DATA     = "sensor.epex_spot_data_price"
 E_SOLAR_HOUR     = "sensor.solcast_pv_forecast_forecast_next_hour"
 E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
 
-# ── Shared state between strategic and tactical layers ────────────────────
+# ── Shared context between strategic and tactical layers ──────────────────
 # Module-level dict; both trigger functions read/write this.
 _ctx = {
     "mode":         "BALANCE",   # GRID_CHARGE | DISCHARGE | EXPORT | BALANCE
@@ -68,7 +72,7 @@ TZ = pytz.timezone("Europe/Vienna")
 def _influx_query(q: str) -> dict:
     """
     Blocking InfluxDB HTTP request.
-    Must always be called via task.executor() to avoid blocking HA's event loop.
+    Always called inside task.executor() to avoid blocking HA's event loop.
     """
     resp = requests.get(
         INFLUX_URL,
@@ -269,14 +273,14 @@ def strategic_optimize():
             log.warning("No EPEX price data available — mode unchanged")
             return
 
-        schedule                 = _build_schedule(consumption, solar, prices)
-        mode, sp, p25, p75       = _compute_mode(soc, schedule)
+        schedule             = _build_schedule(consumption, solar, prices)
+        mode, sp, p25, p75   = _compute_mode(soc, schedule)
 
-        _ctx["mode"]             = mode
-        _ctx["strategic_sp"]     = sp
-        _ctx["p25"]              = p25
-        _ctx["p75"]              = p75
-        _ctx["price"]            = schedule[0]["price"] if schedule else 0.15
+        _ctx["mode"]         = mode
+        _ctx["strategic_sp"] = sp
+        _ctx["p25"]          = p25
+        _ctx["p75"]          = p75
+        _ctx["price"]        = schedule[0]["price"] if schedule else 0.15
 
         # For locked modes apply the setpoint immediately;
         # BALANCE leaves fine-tuning to the 5-sec tactical layer.
@@ -351,3 +355,34 @@ def realtime_control():
 
     except Exception as exc:
         log.error(f"Realtime control error: {exc}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# EVENT TRIGGERS
+# ════════════════════════════════════════════════════════════════════════════
+
+@state_trigger(E_PRICE_DATA)
+def on_price_update(**kwargs):
+    """Fires whenever the EPEX sensor changes (new prices published ~17:00)."""
+    log.info("EPEX price data updated — triggering strategic cycle")
+    strategic_optimize()
+
+
+@state_trigger(E_BATTERY_SOC)
+def on_soc_critical(**kwargs):
+    """Force inverter to 0 W if SOC drops below hard floor (12%)."""
+    soc_raw = state.get(E_BATTERY_SOC)
+    if soc_raw in (None, "unavailable", "unknown"):
+        return
+    if float(soc_raw) < 12:
+        number.set_value(entity_id=E_INV_OUTPUT, value=0)
+        _ctx["mode"]         = "BALANCE"
+        _ctx["setpoint"]     = 0
+        _ctx["strategic_sp"] = 0
+        persistent_notification.create(
+            title="⚠️ Battery Critical",
+            message=f"SOC is {soc_raw}% — inverter forced to 0 W. "
+                    f"Optimizer resumes at next 15-min strategic cycle.",
+            notification_id="energy_optimizer_critical",
+        )
+        log.warning(f"Battery critical ({soc_raw}%) — inverter forced to 0 W")
