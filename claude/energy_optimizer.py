@@ -15,7 +15,6 @@ Only file needed:
 """
 
 import aiohttp
-import statistics
 import pytz
 from datetime import datetime, timedelta
 
