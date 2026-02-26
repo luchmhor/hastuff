@@ -253,7 +253,7 @@ def _apply_if_changed(new_sp: int):
 # Queries InfluxDB + sensors → determines MODE and guidance setpoint
 # ════════════════════════════════════════════════════════════════════════════
 
-@time_trigger("period(now, 0:15:00)")
+@time_trigger("period(now, 15min)")
 def strategic_optimize():
     log.info("── Strategic optimization cycle ──")
     try:
@@ -304,7 +304,7 @@ def strategic_optimize():
 # Real-time proportional control targeting grid_power ≈ 0
 # ════════════════════════════════════════════════════════════════════════════
 
-@time_trigger("period(now, 0:00:05)")
+@time_trigger("period(now, 5s)")
 def realtime_control():
     """
     Every 5 seconds:
