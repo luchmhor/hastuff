@@ -7,6 +7,7 @@ Two-layer control:
   Tactical   (5 sec): real-time proportional controller targeting grid_power ≈ 0
 
 No feed-in tariff — export only occurs to prevent PV curtailment when battery is full.
+Trickle hysteresis keeps battery floating between 96–98% on sunny days.
 
 Requires in configuration.yaml:
   pyscript:
@@ -21,12 +22,14 @@ import pytz
 from datetime import datetime, timedelta
 
 # ── Hardware constants ────────────────────────────────────────────────────
-BATTERY_SIZE_WH   = 2760
-OUTPUT_MIN_W      = -1200
-OUTPUT_MAX_W      =  1200
-BATTERY_FULL_PCT  =  98
-BATTERY_EMPTY_PCT =  15
-GRID_DEADZONE_W   =  10
+BATTERY_SIZE_WH      = 2760
+OUTPUT_MIN_W         = -1200
+OUTPUT_MAX_W         =  1200
+BATTERY_FULL_PCT     =  98
+BATTERY_TRICKLE_PCT  =  96    # lower bound of trickle hysteresis band
+BATTERY_EMPTY_PCT    =  15
+GRID_DEADZONE_W      =  10
+BATTERY_TRICKLE_W    =  10    # watts to nudge battery up or down in trickle mode
 
 # ── Behaviour flags ───────────────────────────────────────────────────────
 ALLOW_EXPORT = False   # True only if you have a feed-in tariff
@@ -55,7 +58,7 @@ E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
 
 # ── Shared context between strategic and tactical layers ──────────────────
 _ctx = {
-    "mode":         "BALANCE",   # GRID_CHARGE | DISCHARGE | BALANCE
+    "mode":         "BALANCE",   # GRID_CHARGE | DISCHARGE | BALANCE | TRICKLE
     "setpoint":     0,
     "strategic_sp": 0,
     "price":        0.15,
@@ -234,16 +237,23 @@ def _compute_mode(soc: float, schedule: list) -> tuple:
             else:
                 return ("BALANCE", 0, p25, p75)
 
-        # ── Battery full ──────────────────────────────────────────────────
-        elif soc >= BATTERY_FULL_PCT:
-            if net < -GRID_DEADZONE_W:
-                # PV surplus → spill exactly the surplus to prevent curtailment
-                # Clamp to valid inverter range; never export more than surplus
-                spill = max(0, min(OUTPUT_MAX_W, int(net * -1)))
-                return ("BALANCE", spill, p25, p75)
+        # ── Battery in trickle / hysteresis zone (96–98%) ─────────────────
+        elif soc >= BATTERY_TRICKLE_PCT:
+            batt_raw = state.get(E_BATTERY_POWER)
+            batt_w   = float(batt_raw) if batt_raw not in (None, "unavailable", "unknown") else 0.0
+            # batt_w > 0 = charging, batt_w < 0 = discharging
+
+            if soc >= BATTERY_FULL_PCT:
+                if net < -GRID_DEADZONE_W:
+                    # True PV surplus even at full battery → spill to prevent curtailment
+                    spill = max(0, min(OUTPUT_MAX_W, int(net * -1)))
+                    return ("BALANCE", spill, p25, p75)
+                else:
+                    # Full, no net surplus → enter trickle to gently make room
+                    return ("TRICKLE", BATTERY_TRICKLE_W, p25, p75)
             else:
-                # Battery full, no surplus → just cover load
-                return ("BALANCE", 0, p25, p75)
+                # Between 96–98%: gently charge back up
+                return ("TRICKLE", -BATTERY_TRICKLE_W, p25, p75)
 
         # ── Normal operation ──────────────────────────────────────────────
         else:
@@ -304,7 +314,7 @@ async def strategic_optimize():
         _ctx["p75"]          = p75
         _ctx["price"]        = schedule[0]["price"] if schedule else 0.15
 
-        if mode != "BALANCE":
+        if mode != "BALANCE" and mode != "TRICKLE":
             _apply_if_changed(sp)
 
         log.info(
@@ -328,10 +338,30 @@ def realtime_control():
     try:
         mode = _ctx["mode"]
 
+        # ── TRICKLE: hysteresis control 96–98% ───────────────────────────
+        if mode == "TRICKLE":
+            soc_raw  = state.get(E_BATTERY_SOC)
+            batt_raw = state.get(E_BATTERY_POWER)
+            soc      = float(soc_raw)  if soc_raw  not in (None, "unavailable", "unknown") else _ctx["last_soc"]
+            batt_w   = float(batt_raw) if batt_raw not in (None, "unavailable", "unknown") else 0.0
+            _ctx["last_soc"] = soc
+
+            if soc >= BATTERY_FULL_PCT and batt_w > 0:
+                # Still charging above full → nudge output up to divert power to load
+                _apply_if_changed(_ctx["setpoint"] + BATTERY_TRICKLE_W)
+            elif soc < BATTERY_TRICKLE_PCT:
+                # Dropped below lower bound → return to BALANCE
+                _ctx["mode"] = "BALANCE"
+                log.info(f"Trickle: SOC {soc:.0f}% < {BATTERY_TRICKLE_PCT}% → BALANCE")
+            # else: within 96–98% band → hold current setpoint
+            return
+
+        # ── GRID_CHARGE / DISCHARGE: re-assert strategic setpoint ─────────
         if mode != "BALANCE":
             _apply_if_changed(_ctx["strategic_sp"])
             return
 
+        # ── BALANCE: proportional real-time grid-following ────────────────
         grid_raw = state.get(E_GRID_POWER)
         if grid_raw in (None, "unavailable", "unknown"):
             return
@@ -355,8 +385,7 @@ def realtime_control():
         if new_sp < current_sp and soc >= BATTERY_FULL_PCT:
             return
 
-        # No export guard — never push setpoint negative unless battery is full
-        # and strategic layer has explicitly allowed spill
+        # No export unless battery is full
         if new_sp < 0 and soc < BATTERY_FULL_PCT:
             new_sp = 0
 
