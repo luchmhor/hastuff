@@ -124,7 +124,10 @@ async def _fetch_historical_consumption() -> dict:
 
     result = {}
     for k, v in accum.items():
-        result[k] = statistics.mean(v)
+        total = 0.0
+        for x in v:
+            total += x
+        result[k] = total / len(v)
     return result
 
 
