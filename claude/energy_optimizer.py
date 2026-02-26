@@ -22,7 +22,7 @@ File structure:
 import pytz
 from datetime import datetime, timedelta
 
-from modules.influx_helper import fetch_historical_consumption
+from influx_helper import fetch_historical_consumption
 
 # ── Hardware constants ────────────────────────────────────────────────────
 BATTERY_SIZE_WH   = 2760
