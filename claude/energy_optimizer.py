@@ -6,6 +6,8 @@ Two-layer control:
   Strategic (15 min): InfluxDB history + Solcast + EPEX → operating MODE + guidance setpoint
   Tactical   (5 sec): real-time proportional controller targeting grid_power ≈ 0
 
+No feed-in tariff — export only occurs to prevent PV curtailment when battery is full.
+
 Requires in configuration.yaml:
   pyscript:
     allow_all_imports: true
@@ -25,6 +27,9 @@ OUTPUT_MAX_W      =  1200
 BATTERY_FULL_PCT  =  98
 BATTERY_EMPTY_PCT =  15
 GRID_DEADZONE_W   =  10
+
+# ── Behaviour flags ───────────────────────────────────────────────────────
+ALLOW_EXPORT = False   # True only if you have a feed-in tariff
 
 # ── Real-time proportional controller tuning ─────────────────────────────
 RT_GAIN      = 0.8
@@ -50,7 +55,7 @@ E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
 
 # ── Shared context between strategic and tactical layers ──────────────────
 _ctx = {
-    "mode":         "BALANCE",
+    "mode":         "BALANCE",   # GRID_CHARGE | DISCHARGE | BALANCE
     "setpoint":     0,
     "strategic_sp": 0,
     "price":        0.15,
@@ -217,25 +222,41 @@ def _compute_mode(soc: float, schedule: list) -> tuple:
 
         price = schedule[0]["price"]
         net   = schedule[0]["net"]
+        # net < 0 → PV surplus (solar > consumption)
+        # net > 0 → deficit (consumption > solar)
 
-        log.info(f"_compute_mode: SOC={soc} price={price} p25={p25} p75={p75} net={net}")
+        log.info(f"_compute_mode: SOC={soc} price={price} p25={p25} p75={p75} net={net:.0f}W")
 
+        # ── Battery empty: charge from grid if price is cheap ─────────────
         if soc <= BATTERY_EMPTY_PCT:
             if price <= p25:
                 return ("GRID_CHARGE", OUTPUT_MIN_W, p25, p75)
             else:
                 return ("BALANCE", 0, p25, p75)
+
+        # ── Battery full ──────────────────────────────────────────────────
         elif soc >= BATTERY_FULL_PCT:
-            if price > 0:
-                return ("EXPORT", OUTPUT_MAX_W, p25, p75)
+            if net < -GRID_DEADZONE_W:
+                # PV surplus → spill exactly the surplus to prevent curtailment
+                # Clamp to valid inverter range; never export more than surplus
+                spill = max(0, min(OUTPUT_MAX_W, int(net * -1)))
+                return ("BALANCE", spill, p25, p75)
             else:
-                return ("BALANCE", max(0, int(net)), p25, p75)
-        elif price >= p75:
-            return ("DISCHARGE", OUTPUT_MAX_W, p25, p75)
-        elif price <= p25:
-            return ("GRID_CHARGE", OUTPUT_MIN_W, p25, p75)
+                # Battery full, no surplus → just cover load
+                return ("BALANCE", 0, p25, p75)
+
+        # ── Normal operation ──────────────────────────────────────────────
         else:
-            return ("BALANCE", int(net), p25, p75)
+            if price >= p75:
+                # Expensive period → discharge to cover load only, never export
+                discharge = max(0, min(OUTPUT_MAX_W, int(net)))
+                return ("DISCHARGE", discharge, p25, p75)
+            elif price <= p25:
+                # Cheap period → charge from grid
+                return ("GRID_CHARGE", OUTPUT_MIN_W, p25, p75)
+            else:
+                # Mid price → self-consume, tactical layer balances
+                return ("BALANCE", int(net), p25, p75)
 
     except Exception as exc:
         log.error(f"_compute_mode error: {exc}")
@@ -328,10 +349,16 @@ def realtime_control():
         raw_sp     = current_sp + RT_GAIN * grid
         new_sp     = int(round(raw_sp / RT_ROUND_W) * RT_ROUND_W)
 
+        # SOC safety guards
         if new_sp > current_sp and soc <= BATTERY_EMPTY_PCT:
             return
         if new_sp < current_sp and soc >= BATTERY_FULL_PCT:
             return
+
+        # No export guard — never push setpoint negative unless battery is full
+        # and strategic layer has explicitly allowed spill
+        if new_sp < 0 and soc < BATTERY_FULL_PCT:
+            new_sp = 0
 
         _apply_if_changed(new_sp)
 
