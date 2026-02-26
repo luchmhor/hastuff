@@ -13,12 +13,16 @@ Additional triggers:
 Requires in configuration.yaml:
   pyscript:
     allow_all_imports: true
+
+File structure:
+  /config/pyscript/energy_optimizer.py   ← this file
+  /config/pyscript/modules/influx_helper.py
 """
 
-import requests
-import statistics
 import pytz
 from datetime import datetime, timedelta
+
+from modules.influx_helper import fetch_historical_consumption
 
 # ── Hardware constants ────────────────────────────────────────────────────
 BATTERY_SIZE_WH   = 2760
@@ -27,14 +31,6 @@ OUTPUT_MAX_W      =  1200    # positive = discharge to home / export to grid
 BATTERY_FULL_PCT  =  98
 BATTERY_EMPTY_PCT =  15
 GRID_DEADZONE_W   =  10
-
-# ── InfluxDB (HTTP API — no external package needed) ─────────────────────
-INFLUX_URL    = "http://localhost:8086/query"
-INFLUX_DB     = "homeassistant"
-INFLUX_USER   = "homeassistant"
-INFLUX_PASS   = "hainflux!"
-INFLUX_ENTITY = "total_consumption"
-INFLUX_UNIT   = "W"            # InfluxDB measurement = HA unit; change to "kW" if needed
 
 # ── Real-time proportional controller tuning ─────────────────────────────
 RT_GAIN      = 0.8   # fraction of grid_power error applied per 5-sec step
@@ -51,7 +47,6 @@ E_SOLAR_HOUR     = "sensor.solcast_pv_forecast_forecast_next_hour"
 E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
 
 # ── Shared context between strategic and tactical layers ──────────────────
-# Module-level dict; both trigger functions read/write this.
 _ctx = {
     "mode":         "BALANCE",   # GRID_CHARGE | DISCHARGE | EXPORT | BALANCE
     "setpoint":     0,           # last setpoint written to HA (W)
@@ -66,81 +61,14 @@ TZ = pytz.timezone("Europe/Vienna")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# LOW-LEVEL HELPERS
+# HELPERS
 # ════════════════════════════════════════════════════════════════════════════
-
-def _influx_query(q: str) -> dict:
-    """
-    Blocking InfluxDB HTTP request.
-    Always called inside task.executor() to avoid blocking HA's event loop.
-    """
-    resp = requests.get(
-        INFLUX_URL,
-        params={"db": INFLUX_DB, "u": INFLUX_USER, "p": INFLUX_PASS, "q": q},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _fetch_historical_consumption() -> dict:
-    """
-    Blocking function: queries InfluxDB for the past 4 same-weekday full days.
-    Returns {(hour, quarter_idx 0–3): mean_watts}.
-    Called via task.executor() from strategic_optimize().
-    """
-    now   = datetime.now(TZ)
-    accum = {}   # {(h, q): [watt_samples_across_4_weeks]}
-
-    for week_back in range(1, 5):
-        anchor    = now - timedelta(weeks=week_back)
-        day_start = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end   = day_start + timedelta(days=1)
-        s_utc     = day_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        e_utc     = day_end.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        q = (
-            f'SELECT mean("value") FROM "{INFLUX_UNIT}" '
-            f"WHERE \"entity_id\" = '{INFLUX_ENTITY}' "
-            f"AND time >= '{s_utc}' AND time < '{e_utc}' "
-            f"GROUP BY time(15m) fill(previous)"
-        )
-        try:
-            data   = _influx_query(q)
-            series = data.get("results", [{}])[0].get("series", [])
-            if not series:
-                continue
-            cols     = series[0]["columns"]
-            t_idx    = cols.index("time")
-            mean_idx = cols.index("mean")
-            for row in series[0].get("values", []):
-                if row[mean_idx] is None:
-                    continue
-                t_local = datetime.fromisoformat(
-                    row[t_idx].replace("Z", "+00:00")
-                ).astimezone(TZ)
-                key = (t_local.hour, t_local.minute // 15)
-                accum.setdefault(key, []).append(row[mean_idx])
-        except Exception as exc:
-            log.warning(f"InfluxDB query error (week -{week_back}): {exc}")
-
-    if not accum:
-        log.warning("No InfluxDB data — using fallback consumption profile")
-        return _fallback_consumption()
-
-    return {k: statistics.mean(v) for k, v in accum.items()}
-
-
-def _fallback_consumption() -> dict:
-    """Rough 24 h load profile (W) when InfluxDB is unavailable."""
-    hourly = [150]*6 + [600]*3 + [350]*8 + [700]*5 + [300]*2
-    return {(h, q): hourly[h] for h in range(24) for q in range(4)}
-
 
 def _get_solar_forecast() -> dict:
     """
     Returns {hour: mean_watts} from Solcast sensor attributes.
-    pv_estimate is mean kW over a 30-min period; accumulate per hour → /4 per 15-min slot.
+    pv_estimate is mean kW over a 30-min period; two 30-min blocks accumulate
+    per hour → divide by 4 at schedule-build time to get average W per 15-min slot.
     """
     solar = {}
     try:
@@ -264,8 +192,9 @@ def strategic_optimize():
         soc = float(soc_raw)
         _ctx["last_soc"] = soc
 
-        # InfluxDB is blocking I/O → must use task.executor
-        consumption = task.executor(_fetch_historical_consumption)
+        # fetch_historical_consumption is a plain Python function in
+        # modules/influx_helper.py — safe to call via task.executor()
+        consumption = task.executor(fetch_historical_consumption)
         solar       = _get_solar_forecast()
         prices      = _get_spot_prices()
 
@@ -386,3 +315,14 @@ def on_soc_critical(**kwargs):
             notification_id="energy_optimizer_critical",
         )
         log.warning(f"Battery critical ({soc_raw}%) — inverter forced to 0 W")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# MANUAL SERVICE CALL
+# ════════════════════════════════════════════════════════════════════════════
+
+@service
+def energy_optimizer_force_run():
+    """Callable via Developer Tools → Actions → pyscript.energy_optimizer_force_run"""
+    log.info("Manual trigger — running strategic cycle now")
+    strategic_optimize()
