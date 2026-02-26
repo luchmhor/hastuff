@@ -45,7 +45,7 @@ E_GRID_POWER     = "sensor.shrdzm_485519e15aae_16_7_0"
 E_BATTERY_SOC    = "sensor.ezhi_battery_state_of_charge"
 E_BATTERY_POWER  = "sensor.ezhi_battery_power"
 E_INV_OUTPUT     = "number.apsystems_ezhi_max_output_power"
-E_PRICE_DATA     = "sensor.epex_spot_data_price"
+E_PRICE_DATA     = "sensor.epex_spot_data_total_price"
 E_SOLAR_HOUR     = "sensor.solcast_pv_forecast_forecast_next_hour"
 E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
 
