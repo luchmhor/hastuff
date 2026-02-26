@@ -164,10 +164,32 @@ def _get_solar_forecast() -> dict:
 def _get_spot_prices() -> dict:
     prices = {}
     try:
-        data = (state.getattr(E_PRICE_DATA) or {}).get("data", [])
+        # Log the raw state for debugging
+        raw_state = state.get(E_PRICE_DATA)
+        raw_attrs = state.getattr(E_PRICE_DATA)
+        log.info(f"EPEX raw state: {raw_state}")
+        log.info(f"EPEX raw attrs keys: {list(raw_attrs.keys()) if raw_attrs else 'None'}")
+
+        data = (raw_attrs or {}).get("data", [])
+
+        # Some versions of ha_epex_spot use 'prices' instead of 'data'
+        if not data:
+            data = (raw_attrs or {}).get("prices", [])
+
+        # Some versions put price directly in the state as JSON string
+        if not data and raw_state:
+            import json
+            try:
+                data = json.loads(raw_state)
+            except Exception:
+                pass
+
+        log.info(f"EPEX data slots found: {len(data)}")
+
         for entry in data:
             t = datetime.fromisoformat(entry["start_time"]).astimezone(TZ)
             prices[(t.hour, t.minute // 15)] = float(entry["price_per_kwh"])
+
     except Exception as exc:
         log.error(f"Spot price error: {exc}")
     return prices
