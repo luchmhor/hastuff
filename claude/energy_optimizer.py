@@ -192,29 +192,40 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
 
 
 def _compute_mode(soc: float, schedule: list) -> tuple:
-    if not schedule:
-        return "BALANCE", 0, 0.10, 0.20
+    try:
+        if not schedule:
+            return ("BALANCE", 0, 0.10, 0.20)
 
-    prices_sorted = sorted(s["price"] for s in schedule)
-    n   = len(prices_sorted)
-    p25 = prices_sorted[max(0, int(n * 0.25) - 1)]
-    p75 = prices_sorted[min(n - 1, int(n * 0.75))]
+        prices_sorted = sorted(s["price"] for s in schedule)
+        n   = len(prices_sorted)
+        p25 = prices_sorted[max(0, int(n * 0.25) - 1)]
+        p75 = prices_sorted[min(n - 1, int(n * 0.75))]
 
-    price = schedule[0]["price"]
-    net   = schedule[0]["net"]
+        price = schedule[0]["price"]
+        net   = schedule[0]["net"]
 
-    if soc <= BATTERY_EMPTY_PCT:
-        return ("GRID_CHARGE", OUTPUT_MIN_W, p25, p75) if price <= p25 \
-               else ("BALANCE", 0, p25, p75)
-    elif soc >= BATTERY_FULL_PCT:
-        return ("EXPORT", OUTPUT_MAX_W, p25, p75) if price > 0 \
-               else ("BALANCE", max(0, int(net)), p25, p75)
-    elif price >= p75:
-        return "DISCHARGE", OUTPUT_MAX_W, p25, p75
-    elif price <= p25:
-        return "GRID_CHARGE", OUTPUT_MIN_W, p25, p75
-    else:
-        return "BALANCE", int(net), p25, p75
+        log.info(f"_compute_mode: SOC={soc} price={price} p25={p25} p75={p75} net={net}")
+
+        if soc <= BATTERY_EMPTY_PCT:
+            if price <= p25:
+                return ("GRID_CHARGE", OUTPUT_MIN_W, p25, p75)
+            else:
+                return ("BALANCE", 0, p25, p75)
+        elif soc >= BATTERY_FULL_PCT:
+            if price > 0:
+                return ("EXPORT", OUTPUT_MAX_W, p25, p75)
+            else:
+                return ("BALANCE", max(0, int(net)), p25, p75)
+        elif price >= p75:
+            return ("DISCHARGE", OUTPUT_MAX_W, p25, p75)
+        elif price <= p25:
+            return ("GRID_CHARGE", OUTPUT_MIN_W, p25, p75)
+        else:
+            return ("BALANCE", int(net), p25, p75)
+
+    except Exception as exc:
+        log.error(f"_compute_mode error: {exc}")
+        return ("BALANCE", 0, 0.10, 0.20)
 
 
 def _apply_if_changed(new_sp: int):
