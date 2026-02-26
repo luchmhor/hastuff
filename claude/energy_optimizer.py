@@ -6,36 +6,39 @@ Two-layer control:
   Strategic (15 min): InfluxDB history + Solcast + EPEX → operating MODE + guidance setpoint
   Tactical   (5 sec): real-time proportional controller targeting grid_power ≈ 0
 
-Additional triggers:
-  - Re-runs strategic cycle immediately when EPEX prices update (~17:00)
-  - Emergency guard: forces inverter to 0 W if SOC drops below hard floor
-
 Requires in configuration.yaml:
   pyscript:
     allow_all_imports: true
 
-File structure:
-  /config/pyscript/energy_optimizer.py   ← this file
-  /config/pyscript/modules/influx_helper.py
+Only file needed:
+  /config/pyscript/energy_optimizer.py
 """
 
+import aiohttp
+import statistics
 import pytz
 from datetime import datetime, timedelta
 
-from influx_helper import fetch_historical_consumption
-
 # ── Hardware constants ────────────────────────────────────────────────────
 BATTERY_SIZE_WH   = 2760
-OUTPUT_MIN_W      = -1200    # negative = grid charging battery
-OUTPUT_MAX_W      =  1200    # positive = discharge to home / export to grid
+OUTPUT_MIN_W      = -1200
+OUTPUT_MAX_W      =  1200
 BATTERY_FULL_PCT  =  98
 BATTERY_EMPTY_PCT =  15
 GRID_DEADZONE_W   =  10
 
 # ── Real-time proportional controller tuning ─────────────────────────────
-RT_GAIN      = 0.8   # fraction of grid_power error applied per 5-sec step
-RT_ROUND_W   = 10    # round setpoint to nearest N watts to reduce chatter
-RT_MIN_DELTA = 10    # minimum W change before writing to HA (avoids spam)
+RT_GAIN      = 0.8
+RT_ROUND_W   = 10
+RT_MIN_DELTA = 10
+
+# ── InfluxDB ─────────────────────────────────────────────────────────────
+INFLUX_URL    = "http://localhost:8086/query"
+INFLUX_DB     = "homeassistant"
+INFLUX_USER   = "homeassistant"
+INFLUX_PASS   = "hainflux!"
+INFLUX_ENTITY = "total_consumption"
+INFLUX_UNIT   = "W"            # change to "kW" if sensor reports in kW
 
 # ── HA entity IDs ─────────────────────────────────────────────────────────
 E_GRID_POWER     = "sensor.shrdzm_485519e15aae_16_7_0"
@@ -48,16 +51,85 @@ E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
 
 # ── Shared context between strategic and tactical layers ──────────────────
 _ctx = {
-    "mode":         "BALANCE",   # GRID_CHARGE | DISCHARGE | EXPORT | BALANCE
-    "setpoint":     0,           # last setpoint written to HA (W)
-    "strategic_sp": 0,           # guidance setpoint from strategic layer
-    "price":        0.15,        # current 15-min slot price
-    "p25":          0.10,        # lower price percentile (24 h horizon)
-    "p75":          0.20,        # upper price percentile (24 h horizon)
-    "last_soc":     50.0,        # cached SOC for tactical layer fallback
+    "mode":         "BALANCE",
+    "setpoint":     0,
+    "strategic_sp": 0,
+    "price":        0.15,
+    "p25":          0.10,
+    "p75":          0.20,
+    "last_soc":     50.0,
 }
 
 TZ = pytz.timezone("Europe/Vienna")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# INFLUXDB — native async via aiohttp (no task.executor needed)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _influx_query(q: str) -> dict:
+    """Async InfluxDB HTTP query — runs natively in HA's event loop."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            INFLUX_URL,
+            params={"db": INFLUX_DB, "u": INFLUX_USER, "p": INFLUX_PASS, "q": q},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json(content_type=None)
+
+
+async def _fetch_historical_consumption() -> dict:
+    """
+    Queries InfluxDB for the past 4 same-weekday full days.
+    Returns {(hour, quarter_idx 0-3): mean_watts}.
+    Fully async — no blocking, no task.executor.
+    """
+    now   = datetime.now(TZ)
+    accum = {}
+
+    for week_back in range(1, 5):
+        anchor    = now - timedelta(weeks=week_back)
+        day_start = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end   = day_start + timedelta(days=1)
+        s_utc     = day_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        e_utc     = day_end.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        q = (
+            f'SELECT mean("value") FROM "{INFLUX_UNIT}" '
+            f"WHERE \"entity_id\" = '{INFLUX_ENTITY}' "
+            f"AND time >= '{s_utc}' AND time < '{e_utc}' "
+            f"GROUP BY time(15m) fill(previous)"
+        )
+        try:
+            data   = await _influx_query(q)
+            series = data.get("results", [{}])[0].get("series", [])
+            if not series:
+                continue
+            cols     = series[0]["columns"]
+            t_idx    = cols.index("time")
+            mean_idx = cols.index("mean")
+            for row in series[0].get("values", []):
+                if row[mean_idx] is None:
+                    continue
+                t_local = datetime.fromisoformat(
+                    row[t_idx].replace("Z", "+00:00")
+                ).astimezone(TZ)
+                key = (t_local.hour, t_local.minute // 15)
+                accum.setdefault(key, []).append(row[mean_idx])
+        except Exception as exc:
+            log.warning(f"InfluxDB query error (week -{week_back}): {exc}")
+
+    if not accum:
+        log.warning("No InfluxDB data — using fallback consumption profile")
+        return _fallback_consumption()
+
+    return {k: statistics.mean(v) for k, v in accum.items()}
+
+
+def _fallback_consumption() -> dict:
+    hourly = [150]*6 + [600]*3 + [350]*8 + [700]*5 + [300]*2
+    return {(h, q): hourly[h] for h in range(24) for q in range(4)}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -65,11 +137,6 @@ TZ = pytz.timezone("Europe/Vienna")
 # ════════════════════════════════════════════════════════════════════════════
 
 def _get_solar_forecast() -> dict:
-    """
-    Returns {hour: mean_watts} from Solcast sensor attributes.
-    pv_estimate is mean kW over a 30-min period; two 30-min blocks accumulate
-    per hour → divide by 4 at schedule-build time to get average W per 15-min slot.
-    """
     solar = {}
     try:
         attrs = state.getattr(E_SOLAR_HOUR) or {}
@@ -87,7 +154,6 @@ def _get_solar_forecast() -> dict:
                 t = datetime.fromisoformat(t_str).astimezone(TZ)
                 solar[t.hour] = solar.get(t.hour, 0.0) + pv_kw * 1000
         if not solar:
-            # Scalar fallback: sensor state = Wh for the next hour = average W for 60 min
             val = float(state.get(E_SOLAR_HOUR) or 0)
             solar[datetime.now(TZ).hour] = val
     except Exception as exc:
@@ -96,7 +162,6 @@ def _get_solar_forecast() -> dict:
 
 
 def _get_spot_prices() -> dict:
-    """Returns {(hour, quarter_idx): EUR/kWh} from EPEX sensor attribute 'data'."""
     prices = {}
     try:
         data = (state.getattr(E_PRICE_DATA) or {}).get("data", [])
@@ -109,18 +174,13 @@ def _get_spot_prices() -> dict:
 
 
 def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
-    """
-    Assembles 96 forward-looking 15-min slots from the current timestamp.
-    net_load > 0 → apartment needs power from battery/grid
-    net_load < 0 → solar surplus, can charge battery or export
-    """
     now = datetime.now(TZ)
     out = []
     for i in range(96):
         t   = now + timedelta(minutes=15 * i)
         key = (t.hour, t.minute // 15)
         c   = consumption.get(key, 300.0)
-        s   = solar.get(t.hour, 0.0) / 4.0   # hourly W → 15-min average W
+        s   = solar.get(t.hour, 0.0) / 4.0
         p   = prices.get(key, 0.15)
         out.append({
             "i": i, "time": t,
@@ -131,16 +191,6 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
 
 
 def _compute_mode(soc: float, schedule: list) -> tuple:
-    """
-    Determines operating mode and strategic setpoint from price percentiles.
-    Returns (mode_str, setpoint_W, p25, p75).
-
-    Modes:
-      GRID_CHARGE  — draw from grid to charge battery (cheap period or SOC critical)
-      DISCHARGE    — maximize battery discharge (expensive period)
-      EXPORT       — max output when battery full and price positive
-      BALANCE      — proportional self-consumption (tactical layer takes over)
-    """
     if not schedule:
         return "BALANCE", 0, 0.10, 0.20
 
@@ -167,7 +217,6 @@ def _compute_mode(soc: float, schedule: list) -> tuple:
 
 
 def _apply_if_changed(new_sp: int):
-    """Write setpoint to HA only when it differs by ≥ RT_MIN_DELTA W."""
     new_sp  = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, new_sp))
     current = _ctx["setpoint"]
     if abs(new_sp - current) >= RT_MIN_DELTA:
@@ -178,11 +227,10 @@ def _apply_if_changed(new_sp: int):
 
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — every 15 minutes
-# Queries InfluxDB + sensors → determines MODE and guidance setpoint
 # ════════════════════════════════════════════════════════════════════════════
 
 @time_trigger("period(now, 15min)")
-def strategic_optimize():
+async def strategic_optimize():
     log.info("── Strategic optimization cycle ──")
     try:
         soc_raw = state.get(E_BATTERY_SOC)
@@ -192,9 +240,8 @@ def strategic_optimize():
         soc = float(soc_raw)
         _ctx["last_soc"] = soc
 
-        # fetch_historical_consumption is a plain Python function in
-        # modules/influx_helper.py — safe to call via task.executor()
-        consumption = task.executor(fetch_historical_consumption)
+        # Fully async — no task.executor needed
+        consumption = await _fetch_historical_consumption()
         solar       = _get_solar_forecast()
         prices      = _get_spot_prices()
 
@@ -211,8 +258,6 @@ def strategic_optimize():
         _ctx["p75"]          = p75
         _ctx["price"]        = schedule[0]["price"] if schedule else 0.15
 
-        # For locked modes apply the setpoint immediately;
-        # BALANCE leaves fine-tuning to the 5-sec tactical layer.
         if mode != "BALANCE":
             _apply_if_changed(sp)
 
@@ -230,43 +275,27 @@ def strategic_optimize():
 
 # ════════════════════════════════════════════════════════════════════════════
 # TACTICAL LAYER — every 5 seconds
-# Real-time proportional control targeting grid_power ≈ 0
 # ════════════════════════════════════════════════════════════════════════════
 
 @time_trigger("period(now, 5s)")
 def realtime_control():
-    """
-    Every 5 seconds:
-
-    GRID_CHARGE / DISCHARGE / EXPORT:
-      Re-applies the strategic setpoint each cycle (guards against inverter resets).
-
-    BALANCE (self-consumption):
-      Proportional controller: new_sp = current_sp + GAIN × grid_power
-        grid_power > 0  →  importing  →  increase output (discharge more / charge less)
-        grid_power < 0  →  exporting  →  decrease output (charge more / export less)
-      Setpoint is rounded to 10 W and only written to HA if change ≥ RT_MIN_DELTA W.
-    """
     try:
         mode = _ctx["mode"]
 
-        # ── Non-BALANCE: re-assert strategic setpoint ─────────────────────
         if mode != "BALANCE":
             _apply_if_changed(_ctx["strategic_sp"])
             return
 
-        # ── BALANCE: proportional real-time control ───────────────────────
         grid_raw = state.get(E_GRID_POWER)
         if grid_raw in (None, "unavailable", "unknown"):
             return
-        grid = float(grid_raw)   # W  (positive = importing, negative = exporting)
+        grid = float(grid_raw)
 
         soc_raw = state.get(E_BATTERY_SOC)
         soc     = float(soc_raw) if soc_raw not in (None, "unavailable", "unknown") \
                   else _ctx["last_soc"]
         _ctx["last_soc"] = soc
 
-        # Dead-zone: skip if grid is already balanced
         if abs(grid) <= GRID_DEADZONE_W:
             return
 
@@ -274,11 +303,10 @@ def realtime_control():
         raw_sp     = current_sp + RT_GAIN * grid
         new_sp     = int(round(raw_sp / RT_ROUND_W) * RT_ROUND_W)
 
-        # Battery SOC safety guards
         if new_sp > current_sp and soc <= BATTERY_EMPTY_PCT:
-            return   # cannot discharge further
+            return
         if new_sp < current_sp and soc >= BATTERY_FULL_PCT:
-            return   # cannot charge further
+            return
 
         _apply_if_changed(new_sp)
 
@@ -291,15 +319,13 @@ def realtime_control():
 # ════════════════════════════════════════════════════════════════════════════
 
 @state_trigger(E_PRICE_DATA)
-def on_price_update(**kwargs):
-    """Fires whenever the EPEX sensor changes (new prices published ~17:00)."""
+async def on_price_update(**kwargs):
     log.info("EPEX price data updated — triggering strategic cycle")
-    strategic_optimize()
+    await strategic_optimize()
 
 
 @state_trigger(E_BATTERY_SOC)
 def on_soc_critical(**kwargs):
-    """Force inverter to 0 W if SOC drops below hard floor (12%)."""
     soc_raw = state.get(E_BATTERY_SOC)
     if soc_raw in (None, "unavailable", "unknown"):
         return
@@ -322,7 +348,7 @@ def on_soc_critical(**kwargs):
 # ════════════════════════════════════════════════════════════════════════════
 
 @service
-def energy_optimizer_force_run():
+async def energy_optimizer_force_run():
     """Callable via Developer Tools → Actions → pyscript.energy_optimizer_force_run"""
     log.info("Manual trigger — running strategic cycle now")
-    strategic_optimize()
+    await strategic_optimize()
