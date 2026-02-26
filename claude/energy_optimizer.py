@@ -32,7 +32,7 @@ RT_GAIN      = 0.8
 RT_ROUND_W   = 10
 RT_MIN_DELTA = 10
 
-# ── InfluxDB ─────────────────────────────────────────────────────────────
+# ── InfluxDB ──────────────────────────────────────────────────────────────
 INFLUX_URL    = "http://localhost:8086/query"
 INFLUX_DB     = "homeassistant"
 INFLUX_USER   = "homeassistant"
@@ -64,11 +64,10 @@ TZ = pytz.timezone("Europe/Vienna")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# INFLUXDB — native async via aiohttp (no task.executor needed)
+# INFLUXDB — native async via aiohttp
 # ════════════════════════════════════════════════════════════════════════════
 
 async def _influx_query(q: str) -> dict:
-    """Async InfluxDB HTTP query — runs natively in HA's event loop."""
     async with aiohttp.ClientSession() as session:
         async with session.get(
             INFLUX_URL,
@@ -83,7 +82,6 @@ async def _fetch_historical_consumption() -> dict:
     """
     Queries InfluxDB for the past 4 same-weekday full days.
     Returns {(hour, quarter_idx 0-3): mean_watts}.
-    Fully async — no blocking, no task.executor.
     """
     now   = datetime.now(TZ)
     accum = {}
@@ -124,12 +122,24 @@ async def _fetch_historical_consumption() -> dict:
         log.warning("No InfluxDB data — using fallback consumption profile")
         return _fallback_consumption()
 
-    return {k: statistics.mean(v) for k, v in accum.items()}
+    result = {}
+    for k, v in accum.items():
+        result[k] = statistics.mean(v)
+    return result
 
 
 def _fallback_consumption() -> dict:
-    hourly = [150]*6 + [600]*3 + [350]*8 + [700]*5 + [300]*2
-    return {(h, q): hourly[h] for h in range(24) for q in range(4)}
+    hourly = [150, 150, 150, 150, 150, 150,   # 00-06 night
+              600, 600, 600,                   # 06-09 morning
+              350, 350, 350, 350, 350,         # 09-14 daytime
+              350, 350, 350, 350,              # 14-17 daytime
+              700, 700, 700, 700, 700,         # 17-22 evening
+              300, 300]                        # 22-24 late
+    result = {}
+    for h in range(24):
+        for q in range(4):
+            result[(h, q)] = hourly[h]
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -140,13 +150,8 @@ def _get_solar_forecast() -> dict:
     solar = {}
     try:
         attrs = state.getattr(E_SOLAR_HOUR) or {}
-        fl    = (
-            attrs.get("forecast") or
-            attrs.get("detailedForecast") or
-            attrs.get("DetailedForecast") or
-            attrs.get("forecasts") or
-            []
-        )
+        fl = attrs.get("forecast") or attrs.get("detailedForecast") or \
+             attrs.get("DetailedForecast") or attrs.get("forecasts") or []
         for entry in fl:
             t_str = entry.get("period_start") or entry.get("PeriodStart")
             pv_kw = float(entry.get("pv_estimate") or entry.get("PvEstimate") or 0)
@@ -184,9 +189,12 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
         s   = solar.get(t.hour, 0.0) / 4.0
         p   = prices.get(key, 0.15)
         out.append({
-            "i": i, "time": t,
-            "cons": c, "solar": s, "price": p,
-            "net": c - s,
+            "i":     i,
+            "time":  t,
+            "cons":  c,
+            "solar": s,
+            "price": p,
+            "net":   c - s,
         })
     return out
 
@@ -196,7 +204,11 @@ def _compute_mode(soc: float, schedule: list) -> tuple:
         if not schedule:
             return ("BALANCE", 0, 0.10, 0.20)
 
-        prices_sorted = sorted(s["price"] for s in schedule)
+        prices_list = []
+        for s in schedule:
+            prices_list.append(s["price"])
+        prices_sorted = sorted(prices_list)
+
         n   = len(prices_sorted)
         p25 = prices_sorted[max(0, int(n * 0.25) - 1)]
         p75 = prices_sorted[min(n - 1, int(n * 0.75))]
@@ -252,7 +264,6 @@ async def strategic_optimize():
         soc = float(soc_raw)
         _ctx["last_soc"] = soc
 
-        # Fully async — no task.executor needed
         consumption = await _fetch_historical_consumption()
         solar       = _get_solar_forecast()
         prices      = _get_spot_prices()
@@ -261,8 +272,8 @@ async def strategic_optimize():
             log.warning("No EPEX price data available — mode unchanged")
             return
 
-        schedule             = _build_schedule(consumption, solar, prices)
-        mode, sp, p25, p75   = _compute_mode(soc, schedule)
+        schedule           = _build_schedule(consumption, solar, prices)
+        mode, sp, p25, p75 = _compute_mode(soc, schedule)
 
         _ctx["mode"]         = mode
         _ctx["strategic_sp"] = sp
