@@ -1,12 +1,30 @@
 pyscript:
-  allow_all_imports: true   # required for requests, pytz, statistics, datetime
+  allow_all_imports: true
+  hass_is_global: true
+  
+input_text:
+  energy_optimizer_mode:
+    name: Energy Optimizer Mode
+    max: 32
+    icon: mdi:battery-charging
 
-input_boolean:
-  energy_optimizer_pause:
-    name: Pause Energy Optimizer
-    icon: mdi:pause-circle
+  energy_optimizer_reason:
+    name: Energy Optimizer Reason
+    max: 255
+    icon: mdi:information-outline
+    
+input_number:
+  energy_optimizer_setpoint:
+    name: Energy Optimizer Setpoint
+    min: -1200
+    max: 1200
+    step: 10
+    unit_of_measurement: W
+    icon: mdi:lightning-bolt
 
-input_button:
-  energy_optimizer_retrigger:
-    name: Re-run Energy Optimizer
-    icon: mdi:refresh
+  energy_optimizer_mode_id:
+    name: Energy Optimizer Mode ID
+    min: 0
+    max: 3
+    step: 1
+    # 0=BALANCE  1=GRID_CHARGE  2=DISCHARGE  3=TRICKLE
