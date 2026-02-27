@@ -1,21 +1,29 @@
 # pyscript/energy_optimizer.py
 """
-Energy Optimizer — pyscript (HACS)
+Energy Optimizer — pyscript (HACS)  —  Strategic planning layer only.
 
-Two-layer control:
-  Strategic (15 min): InfluxDB history + Solcast + EPEX → optimal or heuristic schedule
-  Tactical   (5 sec): real-time proportional controller targeting grid_power ≈ 0
-
-No feed-in tariff — export only occurs to prevent PV curtailment when battery is full.
-Trickle hysteresis keeps battery floating between BATTERY_TRICKLE_PCT and BATTERY_FULL_PCT.
-
-Two optimization modes (set USE_LP_OPTIMIZER below):
-  True  → Linear Program (scipy HiGHS) — globally cost-optimal 96-slot schedule
-  False → Heuristic (P25/P75 percentile rules + forward-looking battery reservation)
+Runs every 30 minutes (and on EPEX price update events).
+Writes mode and setpoint to input_number helpers for the HA tactical automation.
 
 Requires in configuration.yaml:
   pyscript:
     allow_all_imports: true
+
+  input_number:
+    energy_optimizer_setpoint:
+      name: Energy Optimizer Setpoint
+      min: -1200
+      max: 1200
+      step: 10
+      unit_of_measurement: W
+      icon: mdi:lightning-bolt
+    energy_optimizer_mode_id:
+      name: Energy Optimizer Mode ID
+      min: 0
+      max: 3
+      step: 1
+      icon: mdi:state-machine
+      # 0=BALANCE  1=GRID_CHARGE  2=DISCHARGE  3=TRICKLE
 
   input_text:
     energy_optimizer_mode:
@@ -52,13 +60,13 @@ BATTERY_EMPTY_PCT    =  15
 GRID_DEADZONE_W      =  10
 BATTERY_TRICKLE_W    =  10
 
+# ── LP tuning ─────────────────────────────────────────────────────────────
+# Tiny penalty on discharge to prevent LP over-discharging beyond load.
+# Keep well below cheapest expected spot price (~0.05 €/kWh).
+DISCHARGE_PENALTY = 0.0001
+
 # ── Behaviour flags ───────────────────────────────────────────────────────
 ALLOW_EXPORT = False       # True only if you have a feed-in tariff
-
-# ── Real-time proportional controller tuning ─────────────────────────────
-RT_GAIN      = 0.8
-RT_ROUND_W   = 10
-RT_MIN_DELTA = 10
 
 # ── InfluxDB ──────────────────────────────────────────────────────────────
 INFLUX_URL    = "http://localhost:8086/query"
@@ -69,13 +77,22 @@ INFLUX_ENTITY = "total_consumption"
 INFLUX_UNIT   = "W"        # change to "kW" if sensor reports in kW
 
 # ── HA entity IDs ─────────────────────────────────────────────────────────
-E_GRID_POWER     = "sensor.shrdzm_485519e15aae_16_7_0"
 E_BATTERY_SOC    = "sensor.ezhi_battery_state_of_charge"
 E_BATTERY_POWER  = "sensor.ezhi_battery_power"
-E_INV_OUTPUT     = "number.apsystems_ezhi_max_output_power"
 E_PRICE_DATA     = "sensor.epex_spot_data_total_price"
 E_SOLAR_HOUR     = "sensor.solcast_pv_forecast_forecast_next_hour"
 E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
+
+# ── HA output helpers (read by tactical automation) ───────────────────────
+E_MODE_ID   = "input_number.energy_optimizer_mode_id"
+E_SETPOINT  = "input_number.energy_optimizer_setpoint"
+# Mode ID mapping:  0=BALANCE  1=GRID_CHARGE  2=DISCHARGE  3=TRICKLE
+MODE_IDS = {
+    "BALANCE":     0,
+    "GRID_CHARGE": 1,
+    "DISCHARGE":   2,
+    "TRICKLE":     3,
+}
 
 # ── Dashboard input_text helpers ──────────────────────────────────────────
 E_STATUS_MODE   = "input_text.energy_optimizer_mode"
@@ -84,17 +101,11 @@ E_STATUS_REASON = "input_text.energy_optimizer_reason"
 # ── Timezone ──────────────────────────────────────────────────────────────
 TZ = pytz.timezone("Europe/Vienna")
 
-# ── Shared context between strategic and tactical layers ──────────────────
+# ── Internal context (not shared with automation — automation reads helpers) ──
 _ctx = {
-    "mode":             "BALANCE",  # GRID_CHARGE | DISCHARGE | BALANCE | TRICKLE
-    "setpoint":         0,
-    "strategic_sp":     0,
-    "price":            0.15,
-    "p25":              0.10,
-    "p75":              0.20,
-    "last_soc":         50.0,
-    "optimal_schedule": [],
-    "schedule_time":    None,
+    "p25":           0.10,
+    "p75":           0.20,
+    "last_schedule": [],
 }
 
 
@@ -256,13 +267,13 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
       x[t] = inverter output W  (negative=charge, positive=discharge)
       s[t] = grid import W      (slack, >= 0)
 
-    Objective: minimize sum(price[t] * s[t] * DT)
+    Objective:
+      minimize  Σ price[t]*DT*s[t]  +  DISCHARGE_PENALTY*DT*x[t]
 
     Constraints:
-      s[t] >= load[t] - solar[t] - x[t]    (grid import covers deficit)
-      s[t] >= 0                              (no negative import)
-      E_min <= E_now - sum(x[0..k])*DT <= E_max  for all k
-      x[t] in [OUTPUT_MIN_W, OUTPUT_MAX_W]
+      s[t] >= load[t] - solar[t] - x[t]
+      x[t] upper-bound = net_load[t] when net_load > 0 (no export beyond load)
+      E_min <= cumulative energy state <= E_max for all t
     """
     try:
         from scipy.optimize import linprog
@@ -288,14 +299,19 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     # ── Objective ─────────────────────────────────────────────────────────
     c_obj = []
     for t in range(N):
-        c_obj.append(0.0)
+        c_obj.append(DISCHARGE_PENALTY * DT / 1000.0)
     for t in range(N):
         c_obj.append(prices[t] * DT / 1000.0)
 
     # ── Bounds ────────────────────────────────────────────────────────────
     bounds = []
     for t in range(N):
-        bounds.append((float(OUTPUT_MIN_W), float(OUTPUT_MAX_W)))
+        net_load = loads[t] - solars[t]
+        if net_load > 0:
+            upper = min(float(OUTPUT_MAX_W), net_load)
+        else:
+            upper = float(OUTPUT_MAX_W)
+        bounds.append((float(OUTPUT_MIN_W), upper))
     for t in range(N):
         bounds.append((0.0, None))
 
@@ -303,7 +319,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     A_ub = []
     b_ub = []
 
-    # Grid import slack: -x[t] - s[t] <= solar[t] - load[t]
     for t in range(N):
         row = [0.0] * (2 * N)
         row[t]     = -1.0
@@ -311,16 +326,13 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         A_ub.append(row)
         b_ub.append(solars[t] - loads[t])
 
-    # Battery bounds (cumulative energy balance)
     for k in range(N):
-        # Don't over-discharge: sum(x[0..k])*DT <= E_now - E_min
         row = [0.0] * (2 * N)
         for t in range(k + 1):
             row[t] = DT
         A_ub.append(row)
         b_ub.append(E_now - E_min)
 
-        # Don't over-charge: -sum(x[0..k])*DT <= E_max - E_now
         row = [0.0] * (2 * N)
         for t in range(k + 1):
             row[t] = -DT
@@ -343,19 +355,17 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             )
             return _heuristic_schedule(soc, schedule)
 
-        # Extract and round setpoints
         optimal = []
         e       = E_now
         for t in range(N):
             raw = result.x[t]
-            sp  = int(round(raw / RT_ROUND_W) * RT_ROUND_W)
+            sp  = int(round(raw / 10) * 10)
             sp  = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, sp))
             if sp < 0 and e < E_max * 0.99:
                 sp = max(sp, 0)
             optimal.append(sp)
             e = e - sp * DT
 
-        # Compute expected 24h cost for logging
         total_cost = 0.0
         e = E_now
         for t in range(N):
@@ -380,10 +390,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _assess_future_value(schedule: list, p75: float) -> dict:
-    """
-    Scans forward slots for windows where price >= P75 AND net > 0.
-    Returns total Wh demand and slot count in those windows.
-    """
     high_demand_wh = 0.0
     slots          = 0
     for entry in schedule[1:]:
@@ -394,10 +400,6 @@ def _assess_future_value(schedule: list, p75: float) -> dict:
 
 
 def _estimate_pv_recharge(schedule: list, p75: float) -> float:
-    """
-    Estimates Wh of PV surplus available in future slots before the first
-    expensive+high-demand window.
-    """
     surplus_wh = 0.0
     for entry in schedule[1:]:
         if entry["net"] < 0:
@@ -408,10 +410,6 @@ def _estimate_pv_recharge(schedule: list, p75: float) -> float:
 
 
 def _heuristic_schedule(soc: float, schedule: list) -> list:
-    """
-    Builds a 96-slot setpoint list using P25/P75 heuristic rules with
-    forward-looking battery reservation for mid-price slots.
-    """
     if not schedule:
         result = []
         for i in range(96):
@@ -443,29 +441,27 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
 
     result = []
     for s in schedule:
-        price = s["price"]
-        net   = s["net"]
+        price    = s["price"]
+        net      = s["net"]
+        net_load = max(0, int(net))
 
         if soc <= BATTERY_EMPTY_PCT:
-            if price <= p25:
-                sp = OUTPUT_MIN_W
-            else:
-                sp = 0
+            sp = OUTPUT_MIN_W if price <= p25 else 0
         elif price >= p75:
-            sp = max(0, min(OUTPUT_MAX_W, int(net)))
+            sp = min(max(0, min(OUTPUT_MAX_W, int(net))), net_load)
         elif price <= p25:
             sp = OUTPUT_MIN_W
         else:
             if future_value["high_demand_wh"] > 0:
                 if available_wh >= future_value["high_demand_wh"]:
                     if pv_recharge_wh >= future_value["high_demand_wh"]:
-                        sp = int(net)
+                        sp = min(int(net), net_load)
                     else:
                         sp = max(0, int(net - available_wh))
                 else:
-                    sp = int(net)
+                    sp = min(int(net), net_load)
             else:
-                sp = int(net)
+                sp = min(int(net), net_load)
 
         result.append(sp)
 
@@ -501,10 +497,13 @@ def _mode_from_setpoint(sp: int) -> str:
 def _apply_trickle_override(soc: float, sp: int, net: float) -> tuple:
     """
     Returns (mode, setpoint) after applying trickle hysteresis rules.
-    Overrides LP/heuristic slot-0 setpoint when SOC is near full.
+    Overrides LP/heuristic slot-0 when SOC is near full.
+    Export (negative setpoint going to grid) is only permitted here when
+    battery is full AND there is genuine PV surplus.
     """
     if soc >= BATTERY_FULL_PCT:
         if net < -GRID_DEADZONE_W:
+            # PV surplus at full battery — spill minimum to prevent curtailment
             spill = max(0, min(OUTPUT_MAX_W, int(net * -1)))
             return ("BALANCE", spill)
         else:
@@ -516,11 +515,19 @@ def _apply_trickle_override(soc: float, sp: int, net: float) -> tuple:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# DASHBOARD STATUS UPDATE
+# WRITE OUTPUTS TO HA HELPERS
 # ════════════════════════════════════════════════════════════════════════════
 
+def _write_outputs(mode: str, sp: int):
+    """Write mode ID and setpoint to input_number helpers for tactical automation."""
+    mode_id = MODE_IDS.get(mode, 0)
+    input_number.set_value(entity_id=E_MODE_ID,  value=mode_id)
+    input_number.set_value(entity_id=E_SETPOINT, value=sp)
+    log.info(f"Output → mode_id={mode_id} ({mode}) setpoint={sp:+d}W")
+
+
 def _update_status(mode: str, reason: str):
-    """Write current mode and reasoning to HA input_text helpers."""
+    """Write human-readable mode and reasoning to dashboard input_text helpers."""
     mode_icons = {
         "GRID_CHARGE": "⚡ GRID CHARGE",
         "DISCHARGE":   "🔋 DISCHARGE",
@@ -549,7 +556,6 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
     p75 = _ctx.get("p75", 0.20)
 
-    # ── Classify each slot ────────────────────────────────────────────────
     slots = []
     for i in range(len(schedule)):
         if i >= len(optimal_schedule):
@@ -578,7 +584,6 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
             "sp":    sp,
         })
 
-    # ── Merge consecutive same-label slots into windows ───────────────────
     windows = []
     if not slots:
         return
@@ -624,7 +629,6 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         "n_slots":   len(cur_prices),
     })
 
-    # ── Build and log human-readable lines ───────────────────────────────
     label_text = {
         "GRID_CHARGE":    "⚡ Charge from grid",
         "DISCHARGE_PEAK": "🔋 Discharge (peak price)",
@@ -677,24 +681,10 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# APPLY SETPOINT
+# STRATEGIC LAYER — every 30 minutes
 # ════════════════════════════════════════════════════════════════════════════
 
-def _apply_if_changed(new_sp: int):
-    """Write setpoint to HA only when it differs by >= RT_MIN_DELTA W."""
-    new_sp  = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, new_sp))
-    current = _ctx["setpoint"]
-    if abs(new_sp - current) >= RT_MIN_DELTA:
-        number.set_value(entity_id=E_INV_OUTPUT, value=new_sp)
-        _ctx["setpoint"] = new_sp
-        log.debug(f"⚡ inverter {current:+d} W → {new_sp:+d} W")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# STRATEGIC LAYER — every 15 minutes
-# ════════════════════════════════════════════════════════════════════════════
-
-@time_trigger("period(now, 15min)")
+@time_trigger("cron(*/30 * * * *)")
 async def strategic_optimize():
     log.info(
         f"── Strategic optimization cycle "
@@ -706,7 +696,6 @@ async def strategic_optimize():
             log.warning("Battery SOC unavailable — skipping strategic cycle")
             return
         soc = float(soc_raw)
-        _ctx["last_soc"] = soc
 
         consumption = await _fetch_historical_consumption()
         solar       = _get_solar_forecast()
@@ -719,8 +708,7 @@ async def strategic_optimize():
         schedule         = _build_schedule(consumption, solar, prices)
         optimal_schedule = _get_schedule(soc, schedule)
 
-        _ctx["optimal_schedule"] = optimal_schedule
-        _ctx["schedule_time"]    = datetime.now(TZ)
+        _ctx["last_schedule"] = optimal_schedule
 
         raw_sp = optimal_schedule[0] if optimal_schedule else 0
         net    = schedule[0]["net"]   if schedule         else 0.0
@@ -728,12 +716,8 @@ async def strategic_optimize():
 
         mode, sp = _apply_trickle_override(soc, raw_sp, net)
 
-        _ctx["mode"]         = mode
-        _ctx["strategic_sp"] = sp
-        _ctx["price"]        = price
-
-        if mode not in ("BALANCE", "TRICKLE"):
-            _apply_if_changed(sp)
+        # Write to HA helpers — tactical automation reads these
+        _write_outputs(mode, sp)
 
         # ── Build dashboard reason string ─────────────────────────────────
         p25 = _ctx.get("p25", 0.10)
@@ -817,91 +801,12 @@ async def strategic_optimize():
 
         # Log 24h outlook once per hour (first cycle of each hour)
         now = datetime.now(TZ)
-        if now.minute < 15:
+        if now.minute < 30:
             _log_24h_outlook(schedule, optimal_schedule, soc)
 
     except Exception as exc:
         import traceback
         log.error(f"Strategic error: {exc}\n{traceback.format_exc()}")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TACTICAL LAYER — every 5 seconds
-# ════════════════════════════════════════════════════════════════════════════
-
-@time_trigger("period(now, 5s)")
-def realtime_control():
-    """
-    Every 5 seconds:
-
-    TRICKLE:
-      Nudges setpoint ±BATTERY_TRICKLE_W based on live SOC and battery power.
-      Exits to BALANCE when SOC drops below BATTERY_TRICKLE_PCT.
-
-    GRID_CHARGE / DISCHARGE:
-      Re-asserts strategic setpoint (guards against inverter resets).
-
-    BALANCE:
-      Proportional controller: new_sp = current_sp + RT_GAIN * grid_power
-      Targets grid_power ≈ 0. Respects SOC safety guards and no-export rule.
-    """
-    try:
-        mode = _ctx["mode"]
-
-        # ── TRICKLE ───────────────────────────────────────────────────────
-        if mode == "TRICKLE":
-            soc_raw  = state.get(E_BATTERY_SOC)
-            batt_raw = state.get(E_BATTERY_POWER)
-            soc      = float(soc_raw)  if soc_raw  not in (None, "unavailable", "unknown") else _ctx["last_soc"]
-            batt_w   = float(batt_raw) if batt_raw not in (None, "unavailable", "unknown") else 0.0
-            _ctx["last_soc"] = soc
-
-            if soc >= BATTERY_FULL_PCT and batt_w > 0:
-                _apply_if_changed(_ctx["setpoint"] + BATTERY_TRICKLE_W)
-            elif soc < BATTERY_TRICKLE_PCT:
-                _ctx["mode"] = "BALANCE"
-                _update_status(
-                    "BALANCE",
-                    f"Trickle complete. SOC {soc:.0f}% dropped below "
-                    f"{BATTERY_TRICKLE_PCT}% — returning to real-time grid following."
-                )
-                log.info(f"Trickle: SOC {soc:.0f}% < {BATTERY_TRICKLE_PCT}% → BALANCE")
-            return
-
-        # ── GRID_CHARGE / DISCHARGE ───────────────────────────────────────
-        if mode != "BALANCE":
-            _apply_if_changed(_ctx["strategic_sp"])
-            return
-
-        # ── BALANCE ───────────────────────────────────────────────────────
-        grid_raw = state.get(E_GRID_POWER)
-        if grid_raw in (None, "unavailable", "unknown"):
-            return
-        grid = float(grid_raw)
-
-        soc_raw = state.get(E_BATTERY_SOC)
-        soc     = float(soc_raw) if soc_raw not in (None, "unavailable", "unknown") \
-                  else _ctx["last_soc"]
-        _ctx["last_soc"] = soc
-
-        if abs(grid) <= GRID_DEADZONE_W:
-            return
-
-        current_sp = _ctx["setpoint"]
-        raw_sp     = current_sp + RT_GAIN * grid
-        new_sp     = int(round(raw_sp / RT_ROUND_W) * RT_ROUND_W)
-
-        if new_sp > current_sp and soc <= BATTERY_EMPTY_PCT:
-            return
-        if new_sp < current_sp and soc >= BATTERY_FULL_PCT:
-            return
-        if new_sp < 0 and soc < BATTERY_FULL_PCT:
-            new_sp = 0
-
-        _apply_if_changed(new_sp)
-
-    except Exception as exc:
-        log.error(f"Realtime control error: {exc}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -917,27 +822,25 @@ async def on_price_update(**kwargs):
 
 @state_trigger(E_BATTERY_SOC)
 def on_soc_critical(**kwargs):
-    """Force inverter to 0 W if SOC drops below hard floor (12%)."""
+    """Force inverter to 0 W and BALANCE mode if SOC drops below 12%."""
     soc_raw = state.get(E_BATTERY_SOC)
     if soc_raw in (None, "unavailable", "unknown"):
         return
     if float(soc_raw) < 12:
-        number.set_value(entity_id=E_INV_OUTPUT, value=0)
-        _ctx["mode"]         = "BALANCE"
-        _ctx["setpoint"]     = 0
-        _ctx["strategic_sp"] = 0
+        input_number.set_value(entity_id=E_MODE_ID,  value=0)   # BALANCE
+        input_number.set_value(entity_id=E_SETPOINT, value=0)
         _update_status(
             "BALANCE",
             f"⚠️ Emergency: SOC critically low ({soc_raw}%). "
-            f"Inverter forced to 0W. Optimizer resumes at next 15-min cycle."
+            f"Inverter forced to 0W. Optimizer resumes at next 30-min cycle."
         )
         persistent_notification.create(
             title="⚠️ Battery Critical",
             message=f"SOC is {soc_raw}% — inverter forced to 0 W. "
-                    f"Optimizer resumes at next 15-min strategic cycle.",
+                    f"Optimizer resumes at next 30-min strategic cycle.",
             notification_id="energy_optimizer_critical",
         )
-        log.warning(f"Battery critical ({soc_raw}%) — inverter forced to 0 W")
+        log.warning(f"Battery critical ({soc_raw}%) — mode forced to BALANCE, setpoint 0W")
 
 
 # ════════════════════════════════════════════════════════════════════════════
