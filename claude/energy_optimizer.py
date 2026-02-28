@@ -42,6 +42,7 @@ Only file needed:
 import aiohttp
 import pytz
 from datetime import datetime, timedelta
+from scipy.optimize import linprog
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
