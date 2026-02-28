@@ -1,0 +1,3 @@
+type: markdown
+title: ⚡ Energy Optimizer — 24h Outlook
+content: "{{ state_attr('sensor.energy_optimizer_outlook', 'content') }}"
