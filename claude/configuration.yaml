@@ -28,3 +28,10 @@ input_number:
     max: 3
     step: 1
     # 0=BALANCE  1=GRID_CHARGE  2=DISCHARGE  3=TRICKLE
+
+sensor:
+  - platform: command_line
+    name: energy_optimizer_outlook
+    command: "cat /config/www/energy_outlook.md"
+    scan_interval: 60
+
