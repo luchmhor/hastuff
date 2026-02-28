@@ -62,12 +62,10 @@ GRID_DEADZONE_W      =  10
 BATTERY_TRICKLE_W    =  10
 
 # ── LP tuning ─────────────────────────────────────────────────────────────
-# Tiny penalty on discharge to prevent LP over-discharging beyond load.
-# Keep well below cheapest expected spot price (~0.05 €/kWh).
 DISCHARGE_PENALTY = 0.0001
 
 # ── Behaviour flags ───────────────────────────────────────────────────────
-ALLOW_EXPORT = False       # True only if you have a feed-in tariff
+ALLOW_EXPORT = False
 
 # ── InfluxDB ──────────────────────────────────────────────────────────────
 INFLUX_URL    = "http://localhost:8086/query"
@@ -75,7 +73,7 @@ INFLUX_DB     = "homeassistant"
 INFLUX_USER   = "homeassistant"
 INFLUX_PASS   = "hainflux!"
 INFLUX_ENTITY = "total_consumption"
-INFLUX_UNIT   = "W"        # change to "kW" if sensor reports in kW
+INFLUX_UNIT   = "W"
 
 # ── HA entity IDs ─────────────────────────────────────────────────────────
 E_BATTERY_SOC    = "sensor.ezhi_battery_state_of_charge"
@@ -87,7 +85,6 @@ E_SOLAR_TOMORROW = "sensor.solcast_pv_forecast_forecast_tomorrow"
 # ── HA output helpers (read by tactical automation) ───────────────────────
 E_MODE_ID   = "input_number.energy_optimizer_mode_id"
 E_SETPOINT  = "input_number.energy_optimizer_setpoint"
-# Mode ID mapping:  0=BALANCE  1=GRID_CHARGE  2=DISCHARGE  3=TRICKLE
 MODE_IDS = {
     "BALANCE":     0,
     "GRID_CHARGE": 1,
@@ -102,7 +99,7 @@ E_STATUS_REASON = "input_text.energy_optimizer_reason"
 # ── Timezone ──────────────────────────────────────────────────────────────
 TZ = pytz.timezone("Europe/Vienna")
 
-# ── Internal context (not shared with automation — automation reads helpers) ──
+# ── Internal context ──────────────────────────────────────────────────────
 _ctx = {
     "p25":           0.10,
     "p75":           0.20,
@@ -276,13 +273,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
       x[t] upper-bound = net_load[t] when net_load > 0 (no export beyond load)
       E_min <= cumulative energy state <= E_max for all t
     """
-    try:
-        from scipy.optimize import linprog
-        import numpy as np
-    except Exception as exc:
-        log.error(f"scipy/numpy import failed: {exc} — falling back to heuristic")
-        return _heuristic_schedule(soc, schedule)
-
     N     = len(schedule)
     DT    = 0.25
     E_now = soc / 100.0 * BATTERY_SIZE_WH
@@ -499,12 +489,9 @@ def _apply_trickle_override(soc: float, sp: int, net: float) -> tuple:
     """
     Returns (mode, setpoint) after applying trickle hysteresis rules.
     Overrides LP/heuristic slot-0 when SOC is near full.
-    Export (negative setpoint going to grid) is only permitted here when
-    battery is full AND there is genuine PV surplus.
     """
     if soc >= BATTERY_FULL_PCT:
         if net < -GRID_DEADZONE_W:
-            # PV surplus at full battery — spill minimum to prevent curtailment
             spill = max(0, min(OUTPUT_MAX_W, int(net * -1)))
             return ("BALANCE", spill)
         else:
@@ -532,7 +519,7 @@ def _update_status(mode: str, reason: str):
     mode_icons = {
         "GRID_CHARGE": "⚡ GRID CHARGE",
         "DISCHARGE":   "🔋 DISCHARGE",
-        "BALANCE":     "⚖️ BALANCE",
+        "BALANCE":     "🏭 GRID CONSUMPTION",
         "TRICKLE":     "🌿 TRICKLE",
     }
     label = mode_icons.get(mode, mode)
@@ -571,11 +558,11 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         elif sp >= GRID_DEADZONE_W and p >= p75:
             label = "DISCHARGE_PEAK"
         elif sp >= GRID_DEADZONE_W and p < p75:
-            label = "DISCHARGE_MID"
+            label = "COVER_LOAD"
         elif n < -GRID_DEADZONE_W:
             label = "PV_SURPLUS"
         else:
-            label = "BALANCE"
+            label = "GRID_CONSUMPTION"
 
         slots.append({
             "time":  s["time"],
@@ -633,9 +620,9 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     label_text = {
         "GRID_CHARGE":    "⚡ Charge from grid",
         "DISCHARGE_PEAK": "🔋 Discharge (peak price)",
-        "DISCHARGE_MID":  "🔋 Discharge (mid price)",
+        "COVER_LOAD":     "⚖️  Cover load",
         "PV_SURPLUS":     "☀️  PV surplus / spill",
-        "BALANCE":        "⚖️  Follow grid / self-consume",
+        "GRID_CONSUMPTION": "🏭 Grid consumption",
     }
 
     lines = []
@@ -661,7 +648,7 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
         if w["label"] == "GRID_CHARGE":
             detail = f"avg {w['avg_sp']:.0f}W from grid"
-        elif w["label"] in ("DISCHARGE_PEAK", "DISCHARGE_MID"):
+        elif w["label"] in ("DISCHARGE_PEAK", "COVER_LOAD"):
             detail = f"avg {w['avg_sp']:.0f}W output | net demand {w['avg_net']:.0f}W"
         elif w["label"] == "PV_SURPLUS":
             detail = f"avg {abs(w['avg_net']):.0f}W surplus"
@@ -717,7 +704,6 @@ async def strategic_optimize():
 
         mode, sp = _apply_trickle_override(soc, raw_sp, net)
 
-        # Write to HA helpers — tactical automation reads these
         _write_outputs(mode, sp)
 
         # ── Build dashboard reason string ─────────────────────────────────
@@ -761,7 +747,7 @@ async def strategic_optimize():
                 reason = (
                     f"LP optimizer: no strong charge/discharge signal at "
                     f"{price:.4f} €/kWh [P25={p25:.4f} P75={p75:.4f}]. "
-                    f"Following grid in real time. SOC: {soc:.0f}%. "
+                    f"Consuming from grid. SOC: {soc:.0f}%. "
                     f"Slot-0 guidance: {raw_sp:+d}W."
                 )
             else:
@@ -788,8 +774,7 @@ async def strategic_optimize():
                 else:
                     reason = (
                         f"Mid price ({price:.4f} €/kWh). No high-value window ahead. "
-                        f"Self-consuming PV, following grid in real time. "
-                        f"SOC: {soc:.0f}%."
+                        f"Consuming from grid. SOC: {soc:.0f}%."
                     )
 
         _update_status(mode, reason)
@@ -800,7 +785,6 @@ async def strategic_optimize():
             f"Optimizer={raw_sp:+d}W → Applied={sp:+d}W"
         )
 
-        # Log 24h outlook once per hour (first cycle of each hour)
         now = datetime.now(TZ)
         if now.minute < 30:
             _log_24h_outlook(schedule, optimal_schedule, soc)
