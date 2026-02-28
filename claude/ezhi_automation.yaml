@@ -1,13 +1,13 @@
 alias: Energy Optimizer — Tactical Control
 description: >
-  Adjusts inverter output every 5 seconds based on optimizer mode and live grid
-  power from shrdzm sensor. Strategic setpoints from pyscript are used only for
-  GRID_CHARGE mode. All other modes follow the live grid sensor.
-triggers:
-  - seconds: /5
-    trigger: time_pattern
-conditions: []
-actions:
+  Adjusts inverter output every 5 seconds based on optimizer mode and live
+  grid power from shrdzm sensor. Strategic setpoints from pyscript are used
+  only for GRID_CHARGE mode. All other modes follow the live grid sensor.
+trigger:
+  - platform: time_pattern
+    seconds: "/5"
+condition: []
+action:
   - variables:
       mode_id: "{{ states('input_number.energy_optimizer_mode_id') | int }}"
       strategic_sp: "{{ states('input_number.energy_optimizer_setpoint') | float }}"
@@ -15,18 +15,28 @@ actions:
       current_sp: "{{ states('number.apsystems_ezhi_max_output_power') | float }}"
       soc: "{{ states('sensor.ezhi_battery_state_of_charge') | float }}"
       batt_w: "{{ states('sensor.ezhi_battery_power') | float }}"
+
   - choose:
+
+      # ── GRID_CHARGE: re-assert fixed strategic setpoint (−1200W) ─────────
+      # This is the only mode where the python setpoint is written directly.
+      # The battery charges at maximum rate regardless of live grid reading.
       - conditions:
           - condition: template
             value_template: "{{ mode_id == 1 }}"
         sequence:
           - condition: template
             value_template: "{{ (current_sp - strategic_sp) | abs > 10 }}"
-          - target:
+          - service: number.set_value
+            target:
               entity_id: number.apsystems_ezhi_max_output_power
             data:
               value: "{{ strategic_sp }}"
-            action: number.set_value
+
+      # ── TRICKLE: SOC hysteresis nudge (96–98% band) ───────────────────────
+      # SOC >= 98% and still charging → nudge output up to divert PV to load
+      # SOC < 96%                     → nudge output down to allow recharge
+      # SOC 96–98%                    → hold, no action
       - conditions:
           - condition: template
             value_template: "{{ mode_id == 3 }}"
@@ -36,65 +46,98 @@ actions:
                   - condition: template
                     value_template: "{{ soc >= 98 and batt_w > 0 }}"
                 sequence:
-                  - target:
+                  - service: number.set_value
+                    target:
                       entity_id: number.apsystems_ezhi_max_output_power
                     data:
                       value: "{{ [1200, current_sp + 10] | min }}"
-                    action: number.set_value
               - conditions:
                   - condition: template
                     value_template: "{{ soc < 96 }}"
                 sequence:
-                  - target:
+                  - service: number.set_value
+                    target:
                       entity_id: number.apsystems_ezhi_max_output_power
                     data:
                       value: "{{ [-1200, current_sp - 10] | max }}"
-                    action: number.set_value
+              # else: within 96–98% band → hold, do nothing
+
+      # ── BALANCE + DISCHARGE: proportional grid-following via shrdzm ───────
+      # Both modes use live grid sensor to target grid ≈ 0W.
+      # The python setpoint is intentionally ignored here — it is a planning
+      # forecast only. Real control comes from the shrdzm reading.
+      #
+      # DISCHARGE differs from BALANCE only in the python optimizer's intent
+      # (battery is planned to cover load during expensive period), but the
+      # execution is identical: follow the grid sensor in real time.
+      #
+      # Safety rules enforced here:
+      #   - No export unless SOC >= 98% (curtailment prevention only)
+      #   - If already exporting, reduce setpoint — never increase
+      #   - Never increase discharge if SOC <= 15%
       - conditions:
           - condition: template
             value_template: "{{ mode_id in [0, 2] }}"
         sequence:
           - variables:
+              # Deadband: ignore grid fluctuations smaller than this.
+              # Covers normal load noise (fridge cycling, standby, etc.)
               deadband: 30
+
+              # Gain: correct only 50% of error per 5-second step.
+              # Lower gain = damped response, no overshoot/oscillation.
               gain: 0.5
-              raw_delta: |
+
+              # Raw correction: proportional to grid error outside deadband
+              raw_delta: >
                 {% if grid_w | abs > deadband %}
                   {{ (gain * grid_w) | round(0) | int }}
                 {% else %}
                   0
                 {% endif %}
-              delta: |
+
+              # Round to 20W steps to reduce inverter chatter
+              delta: >
                 {{ ((raw_delta / 20) | round(0) | int) * 20 }}
+
               proposed_sp: "{{ current_sp + delta }}"
+
+              # Apply all safety clamps in sequence
               new_sp: >
                 {% set s = proposed_sp | float %}
 
-                {# Hard inverter limits #} {% set s = [s, 1200] | min %} {% set
-                s = [s, -1200] | max %}
+                {# Hard inverter limits #}
+                {% set s = [s, 1200] | min %}
+                {% set s = [s, -1200] | max %}
 
-                {# No export unless battery is full (>= 98%) #} {# Only
-                exception: PV curtailment prevention handled by python #} {% if
-                s < 0 and soc < 98 %}
+                {# No export unless battery is full (>= 98%) #}
+                {# Only exception: PV curtailment prevention handled by python #}
+                {% if s < 0 and soc < 98 %}
                   {% set s = 0 %}
                 {% endif %}
 
-                {# Already exporting → reduce setpoint, never increase #} {% if
-                grid_w < -30 and delta > 0 %}
+                {# Already exporting → reduce setpoint, never increase #}
+                {% if grid_w < -30 and delta > 0 %}
                   {% set s = [0, current_sp - 20] | max %}
                 {% endif %}
 
-                {# SOC floor: never increase discharge if battery empty #} {% if
-                delta > 0 and soc <= 15 %}
+                {# SOC floor: never increase discharge if battery empty #}
+                {% if delta > 0 and soc <= 15 %}
                   {% set s = current_sp %}
                 {% endif %}
 
                 {{ s | int }}
+
+          # Only write to inverter if change is meaningful (>= 20W)
+          # Prevents flooding the inverter API with tiny adjustments
           - condition: template
             value_template: "{{ (new_sp - current_sp) | abs >= 20 }}"
-          - target:
+
+          - service: number.set_value
+            target:
               entity_id: number.apsystems_ezhi_max_output_power
             data:
               value: "{{ new_sp }}"
-            action: number.set_value
+
 mode: single
 max_exceeded: silent
