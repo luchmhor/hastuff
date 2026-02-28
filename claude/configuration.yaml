@@ -29,9 +29,11 @@ input_number:
     step: 1
     # 0=BALANCE  1=GRID_CHARGE  2=DISCHARGE  3=TRICKLE
 
-sensor:
-  - platform: command_line
-    name: energy_optimizer_outlook
-    command: "cat /config/www/energy_outlook.md"
-    scan_interval: 60
-
+command_line:
+  - sensor:
+      name: energy_optimizer_outlook
+      command: "python3 -c \"import json; f=open('/config/www/energy_outlook.md'); print(json.dumps({'content': f.read()}))\""
+      scan_interval: 1800
+      value_template: "OK"
+      json_attributes:
+        - content
