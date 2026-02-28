@@ -35,6 +35,17 @@ Requires in configuration.yaml:
       max: 255
       icon: mdi:information-outline
 
+  sensor:
+    - platform: command_line
+      name: energy_optimizer_outlook
+      command: "cat /config/www/energy_outlook.md"
+      scan_interval: 60
+
+  # Lovelace Markdown card:
+  #   type: markdown
+  #   title: Energy Optimizer — 24h Outlook
+  #   content: "{{ states('sensor.energy_optimizer_outlook') }}"
+
 Only file needed:
   /config/pyscript/energy_optimizer.py
 """
@@ -95,6 +106,9 @@ MODE_IDS = {
 # ── Dashboard input_text helpers ──────────────────────────────────────────
 E_STATUS_MODE   = "input_text.energy_optimizer_mode"
 E_STATUS_REASON = "input_text.energy_optimizer_reason"
+
+# ── Outlook file path (served via /local/ in Lovelace) ────────────────────
+OUTLOOK_FILE = "/config/www/energy_outlook.md"
 
 # ── Timezone ──────────────────────────────────────────────────────────────
 TZ = pytz.timezone("Europe/Vienna")
@@ -529,13 +543,14 @@ def _update_status(mode: str, reason: str):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 24H OUTLOOK LOGGER
+# 24H OUTLOOK LOGGER + FILE WRITER
 # ════════════════════════════════════════════════════════════════════════════
 
 def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     """
     Logs a human-readable 24h operational outlook by merging consecutive
     slots with the same planned action into labelled time windows.
+    Also writes a Markdown file for the Lovelace command_line sensor card.
     Called once per hour from strategic_optimize().
     """
     if not schedule or not optimal_schedule:
@@ -618,19 +633,33 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     })
 
     label_text = {
-        "GRID_CHARGE":    "⚡ Charge from grid",
-        "DISCHARGE_PEAK": "🔋 Discharge (peak price)",
-        "COVER_LOAD":     "⚖️  Cover load",
-        "PV_SURPLUS":     "☀️  PV surplus / spill",
+        "GRID_CHARGE":      "⚡ Charge from grid",
+        "DISCHARGE_PEAK":   "🔋 Discharge (peak price)",
+        "COVER_LOAD":       "⚖️ Cover load",
+        "PV_SURPLUS":       "☀️ PV surplus / spill",
         "GRID_CONSUMPTION": "🏭 Grid consumption",
     }
 
-    lines = []
-    lines.append(
+    # ── Log lines (unchanged behaviour) ───────────────────────────────────
+    log_lines = []
+    log_lines.append(
         f"─── 24h Outlook ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) | "
         f"SOC {soc:.0f}% | "
         f"P25={_ctx.get('p25', 0):.4f} P75={_ctx.get('p75', 0):.4f} €/kWh ───"
     )
+
+    # ── Markdown lines (for Lovelace card) ────────────────────────────────
+    now_str = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+    md_lines = []
+    md_lines.append(
+        f"**{'LP' if USE_LP_OPTIMIZER else 'Heuristic'} optimizer** | "
+        f"SOC **{soc:.0f}%** | "
+        f"P25 {_ctx.get('p25', 0):.4f} · P75 {_ctx.get('p75', 0):.4f} €/kWh  "
+        f"<small>_(updated {now_str})_</small>"
+    )
+    md_lines.append("")
+    md_lines.append("| Time | Strategy | Price |")
+    md_lines.append("|------|----------|-------|")
 
     for w in windows:
         start_str = w["start"].strftime("%H:%M")
@@ -643,29 +672,42 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         else:
             price_str = (
                 f"{w['avg_price']:.4f} €/kWh "
-                f"(range {w['min_price']:.4f}–{w['max_price']:.4f})"
+                f"({w['min_price']:.4f}–{w['max_price']:.4f})"
             )
 
         if w["label"] == "GRID_CHARGE":
             detail = f"avg {w['avg_sp']:.0f}W from grid"
         elif w["label"] in ("DISCHARGE_PEAK", "COVER_LOAD"):
-            detail = f"avg {w['avg_sp']:.0f}W output | net demand {w['avg_net']:.0f}W"
+            detail = f"avg {w['avg_sp']:.0f}W | net {w['avg_net']:.0f}W"
         elif w["label"] == "PV_SURPLUS":
             detail = f"avg {abs(w['avg_net']):.0f}W surplus"
         else:
-            detail = f"avg net load {w['avg_net']:+.0f}W"
+            detail = f"net {w['avg_net']:+.0f}W"
 
-        lines.append(
+        log_line = (
             f"  {start_str}–{end_str} ({duration:3d}min)  "
             f"{desc:<32}  {price_str:<48}  {detail}"
         )
+        log_lines.append(log_line)
 
-    lines.append(
+        md_lines.append(
+            f"| `{start_str}–{end_str}` ({duration}min) | {desc} | {price_str} |"
+        )
+
+    log_lines.append(
         "────────────────────────────────────────────────────────────────"
     )
 
-    for line in lines:
+    for line in log_lines:
         log.info(line)
+
+    # ── Write Markdown file for Lovelace ──────────────────────────────────
+    try:
+        with open(OUTLOOK_FILE, "w") as f:
+            f.write("\n".join(md_lines))
+        log.info(f"Outlook written to {OUTLOOK_FILE}")
+    except Exception as exc:
+        log.warning(f"Could not write outlook file: {exc}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -785,6 +827,7 @@ async def strategic_optimize():
             f"Optimizer={raw_sp:+d}W → Applied={sp:+d}W"
         )
 
+        # Log and write 24h outlook once per hour (first cycle of each hour)
         now = datetime.now(TZ)
         if now.minute < 30:
             _log_24h_outlook(schedule, optimal_schedule, soc)
@@ -812,7 +855,7 @@ def on_soc_critical(**kwargs):
     if soc_raw in (None, "unavailable", "unknown"):
         return
     if float(soc_raw) < 12:
-        input_number.set_value(entity_id=E_MODE_ID,  value=0)   # BALANCE
+        input_number.set_value(entity_id=E_MODE_ID,  value=0)
         input_number.set_value(entity_id=E_SETPOINT, value=0)
         _update_status(
             "BALANCE",
