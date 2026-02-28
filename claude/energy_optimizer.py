@@ -703,13 +703,12 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
     # ── Write Markdown file for Lovelace ──────────────────────────────────
     try:
-      import builtins
-      with builtins.open(OUTLOOK_FILE, "w") as f:
-          f.write("\n".join(md_lines))
-      log.info(f"Outlook written to {OUTLOOK_FILE}")
+        import builtins
+        with builtins.open(OUTLOOK_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(md_lines))
+        log.info(f"Outlook written to {OUTLOOK_FILE}")
     except Exception as exc:
-      log.warning(f"Could not write outlook file: {exc}")  
-
+        log.warning(f"Could not write outlook file: {exc}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — every 30 minutes
