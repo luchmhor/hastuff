@@ -726,19 +726,9 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     # ── Write Markdown file ────────────────────
     try:
         content = "\n".join(md_lines)
-        import subprocess
-        proc = subprocess.run(
-            ["python3", "-c",
-             "import sys; open('/config/www/energy_outlook.md','w',encoding='utf-8').write(sys.stdin.read())"],
-            input=content,
-            text=True,
-            capture_output=True,
-            timeout=10,
-        )
-        if proc.returncode == 0:
-            log.info(f"Outlook written to {OUTLOOK_FILE}")
-        else:
-            log.warning(f"Outlook write failed: {proc.stderr}")
+        with open(OUTLOOK_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info(f"Outlook written to {OUTLOOK_FILE}")
     except Exception as exc:
         log.warning(f"Could not write outlook file: {exc}")
 
