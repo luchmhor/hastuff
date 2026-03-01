@@ -197,26 +197,33 @@ def _get_solar_forecast() -> dict:
     now   = datetime.now(TZ)
 
     def _parse_hourly(fl, filter_date=None):
-        result = {}
-        for entry in fl:
-            t_raw = entry.get("period_start")
-            pv_kw = float(entry.get("pv_estimate") or 0)
-            if t_raw is None:
-                continue
-            if isinstance(t_raw, str):
-                t = datetime.fromisoformat(t_raw)
-                if t.tzinfo is None:
-                    t = t.replace(tzinfo=timezone.utc)
-                t = t.astimezone(TZ)
-            else:
-                try:
-                    t = t_raw.astimezone(TZ)
-                except Exception:
-                    t = datetime(*t_raw.timetuple()[:6], tzinfo=timezone.utc).astimezone(TZ)
-            if filter_date is not None and t.date() != filter_date:
-                continue
-            result[t.hour] = pv_kw * 1000
-        return result
+      result = {}
+      for entry in fl:
+          t_raw = entry.get("period_start")
+          pv_kw = float(entry.get("pv_estimate") or 0)
+          if t_raw is None:
+              continue
+          # ── DEBUG: log first entry only ──
+          if not result:
+              log.info(f"Solar debug: type={type(t_raw).__name__} repr={repr(t_raw)} tzinfo={getattr(t_raw, 'tzinfo', 'N/A')}")
+          if isinstance(t_raw, str):
+              t = datetime.fromisoformat(t_raw)
+              if t.tzinfo is None:
+                  t = t.replace(tzinfo=timezone.utc)
+              t = t.astimezone(TZ)
+          else:
+              try:
+                  t = t_raw.astimezone(TZ)
+                  if t.tzinfo is None:
+                      t = t.replace(tzinfo=timezone.utc).astimezone(TZ)
+              except Exception:
+                  t = datetime(*t_raw.timetuple()[:6], tzinfo=timezone.utc).astimezone(TZ)
+          if not result:
+              log.info(f"Solar debug: parsed t={t} date={t.date()} hour={t.hour}")
+          if filter_date is not None and t.date() != filter_date:
+              continue
+          result[t.hour] = pv_kw * 1000
+      return result
 
     # Load today's remaining hours
     try:
