@@ -215,7 +215,7 @@ def _fallback_consumption() -> dict:
 def _get_solar_forecast() -> dict:
     """
     Returns {hour: watts} for as many hours as Solcast provides.
-    Tries multiple known Solcast entity/attribute combinations.
+    Handles both string and pre-parsed datetime period_start values.
     """
     solar = {}
 
@@ -238,15 +238,27 @@ def _get_solar_forecast() -> dict:
             if not fl:
                 continue
             for entry in fl:
-                t_str = entry.get("period_start") or entry.get("PeriodStart")
+                t_raw = entry.get("period_start") or entry.get("PeriodStart")
                 pv_kw = float(
                     entry.get("pv_estimate")
                     or entry.get("PvEstimate")
                     or 0
                 )
-                if t_str:
-                    t = datetime.fromisoformat(t_str).astimezone(TZ)
-                    solar[t.hour] = solar.get(t.hour, 0.0) + pv_kw * 1000
+                if t_raw is None:
+                    continue
+
+                # Handle both pre-parsed datetime and ISO string
+                if isinstance(t_raw, str):
+                    t = datetime.fromisoformat(t_raw).astimezone(TZ)
+                else:
+                    # already a datetime object
+                    try:
+                        t = t_raw.astimezone(TZ)
+                    except Exception:
+                        t = datetime(*t_raw.timetuple()[:6], tzinfo=TZ)
+
+                solar[t.hour] = solar.get(t.hour, 0.0) + pv_kw * 1000
+
             if solar:
                 log.info(
                     f"Solar forecast loaded from {entity}: "
