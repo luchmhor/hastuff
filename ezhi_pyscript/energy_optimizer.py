@@ -592,6 +592,11 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         else:
             label = "GRID_CONSUMPTION"
 
+        # grid_w: total grid draw — positive = import, includes battery charging power
+        grid_w = s["cons"] - s["solar"] - sp
+        if not ALLOW_EXPORT:
+            grid_w = max(grid_w, 0.0)
+
         slots.append({
             "time":    s["time"],
             "label":   label,
@@ -599,7 +604,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
             "cons_w":  s["cons"],
             "pv_w":    s["solar"],
             "batt_w":  sp,
-            "grid_w":  max(0.0, n - sp),
+            "grid_w":  grid_w,
             "soc_pct": soc_after,
         })
         e = e_after
@@ -669,8 +674,8 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         f"<small>_(updated {now_str})_</small>"
     )
     md_lines.append("")
-    md_lines.append("| Time | Strategy | Price | Consumption | PV forecast | Grid import | PV/Batt output | SOC end |")
-    md_lines.append("|------|----------|-------|-------------|-------------|-------------|----------------|---------|")
+    md_lines.append("| Time | Strategy | Price | Consumption | PV forecast | Grid import | Batt setpoint | SOC end |")
+    md_lines.append("|------|----------|-------|-------------|-------------|-------------|---------------|---------|")
 
     for w in windows:
         start_str   = w["start"].strftime("%H:%M")
@@ -685,7 +690,6 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         avg_grid    = _avg(w["grid_w"])
         avg_batt    = _avg(w["batt_w"])
         soc_end     = w["soc_pct"][-1]
-        avg_pv_batt = avg_pv + max(0.0, avg_batt)
         avg_ct      = avg_price * 100
         min_ct      = min_price * 100
         max_ct      = max_price * 100
@@ -695,7 +699,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
             f"  {start_str}–{end_str} ({duration:3d}min)  "
             f"{desc:<32}  {price_str:<22}  "
             f"cons {avg_cons:.0f}W  pv {avg_pv:.0f}W  "
-            f"grid {avg_grid:.0f}W  pv/batt {avg_pv_batt:.0f}W  "
+            f"grid {avg_grid:+.0f}W  batt {avg_batt:+.0f}W  "
             f"SOC→{soc_end:.0f}%"
         )
         md_lines.append(
@@ -704,12 +708,13 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
             f"| {price_str} "
             f"| {avg_cons:.0f} W "
             f"| {avg_pv:.0f} W "
-            f"| {avg_grid:.0f} W "
-            f"| {avg_pv_batt:.0f} W "
+            f"| {avg_grid:+.0f} W "
+            f"| {avg_batt:+.0f} W "
             f"| {soc_end:.0f}% |"
         )
 
     log_lines.append("────────────────────────────────────────────────────────────────")
+
     if LOG_DEBUG:
         for line in log_lines:
             log.info(line)
