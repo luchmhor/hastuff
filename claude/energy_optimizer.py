@@ -203,7 +203,8 @@ def _get_solar_forecast() -> dict:
     }
 
     def _parse_entries(fl):
-        result = {}
+        """Returns {hour: avg_watts} — averages multiple slots per hour."""
+        buckets = {}   # {hour: [watts, ...]}
         for entry in fl:
             t_raw = entry.get("period_start") or entry.get("PeriodStart")
             pv_kw = float(
@@ -218,13 +219,14 @@ def _get_solar_forecast() -> dict:
                     t = t_raw.astimezone(TZ)
                 except Exception:
                     t = datetime(*t_raw.timetuple()[:6], tzinfo=TZ)
-            result[t.hour] = result.get(t.hour, 0.0) + pv_kw * 1000
-        return result
+            buckets.setdefault(t.hour, []).append(pv_kw * 1000)
+        # Average watts across all slots in the hour
+        return {h: sum(v) / len(v) for h, v in buckets.items()}
 
+    # Load today first, then fill remaining hours from tomorrow
     for entity in [E_SOLAR_TODAY, E_SOLAR_TOMORROW]:
         try:
             attrs = state.getattr(entity) or {}
-
             fl = (
                 attrs.get("detailedForecast")
                 or attrs.get("DetailedForecast")
@@ -232,46 +234,43 @@ def _get_solar_forecast() -> dict:
                 or attrs.get("forecasts")
                 or []
             )
-
-            if fl:
-                parsed = _parse_entries(fl)
-                for h, w in parsed.items():
-                    solar[h] = solar.get(h, 0.0) + w
-            else:
+            if not fl:
                 for key, val in attrs.items():
                     if key in SKIP_KEYS or key.startswith("estimate"):
                         continue
                     if isinstance(val, list) and val and isinstance(val[0], dict):
                         log.info(f"Solar: using attr '{key}' on {entity}")
-                        parsed = _parse_entries(val)
-                        for h, w in parsed.items():
-                            solar[h] = solar.get(h, 0.0) + w
+                        fl = val
+                        break
 
-            if solar:
-                peak_hour = max(solar, key=solar.get)
-                log.info(
-                    f"Solar forecast loaded from {entity}: "
-                    f"{len(solar)} hours, "
-                    f"peak {max(solar.values()):.0f}W at "
-                    f"{peak_hour:02d}:00"
-                )
-                for h in sorted(solar.keys()):
-                    if solar[h] > 0:
-                        log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W")
+            if fl:
+                parsed = _parse_entries(fl)
+                # Only add hours not already covered by today
+                for h, w in parsed.items():
+                    if h not in solar:
+                        solar[h] = w
 
         except Exception as exc:
             log.warning(f"Solar forecast error for {entity}: {exc}")
 
-    if not solar:
-        try:
-            val = float(state.get(E_SOLAR_HOUR) or 0)
-            solar[datetime.now(TZ).hour] = val
-            log.warning(
-                f"Solcast detailed forecast unavailable — "
-                f"using scalar fallback: {val}W for current hour only"
-            )
-        except Exception as exc:
-            log.warning(f"Solar scalar fallback error: {exc}")
+    if solar:
+        peak_hour = max(solar, key=solar.get)
+        log.info(
+            f"Solar forecast: {len(solar)} hours, "
+            f"peak {max(solar.values()):.0f}W at {peak_hour:02d}:00"
+        )
+        for h in sorted(solar.keys()):
+            if solar[h] > 0:
+                log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W")
+        return solar
+
+    # Last resort scalar fallback
+    try:
+        val = float(state.get(E_SOLAR_HOUR) or 0)
+        solar[datetime.now(TZ).hour] = val
+        log.warning(f"Solcast fallback: {val}W for current hour only")
+    except Exception as exc:
+        log.warning(f"Solar scalar fallback error: {exc}")
 
     return solar
 
