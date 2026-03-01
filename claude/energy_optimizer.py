@@ -215,6 +215,7 @@ def _fallback_consumption() -> dict:
 def _get_solar_forecast() -> dict:
     """
     Returns {hour: watts} for as many hours as Solcast provides.
+    Tries multiple known Solcast entity/attribute combinations.
     Handles both string and pre-parsed datetime period_start values.
     """
     solar = {}
@@ -237,6 +238,7 @@ def _get_solar_forecast() -> dict:
             )
             if not fl:
                 continue
+
             for entry in fl:
                 t_raw = entry.get("period_start") or entry.get("PeriodStart")
                 pv_kw = float(
@@ -251,25 +253,32 @@ def _get_solar_forecast() -> dict:
                 if isinstance(t_raw, str):
                     t = datetime.fromisoformat(t_raw).astimezone(TZ)
                 else:
-                    # already a datetime object
                     try:
                         t = t_raw.astimezone(TZ)
                     except Exception:
                         t = datetime(*t_raw.timetuple()[:6], tzinfo=TZ)
 
+                # Accumulate — Solcast uses 30-min slots, two per hour
                 solar[t.hour] = solar.get(t.hour, 0.0) + pv_kw * 1000
 
             if solar:
+                peak_hour = max(solar, key=solar.get)
                 log.info(
                     f"Solar forecast loaded from {entity}: "
                     f"{len(solar)} hours, "
                     f"peak {max(solar.values()):.0f}W at "
-                    f"{max(solar, key=solar.get):02d}:00"
+                    f"{peak_hour:02d}:00"
                 )
+                # Log full profile for verification
+                for h in sorted(solar.keys()):
+                    if solar[h] > 0:
+                        log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W")
                 break
+
         except Exception as exc:
             log.warning(f"Solar forecast error for {entity}: {exc}")
 
+    # Last resort: scalar value from E_SOLAR_HOUR for current hour only
     if not solar:
         try:
             val = float(state.get(E_SOLAR_HOUR) or 0)
@@ -282,7 +291,6 @@ def _get_solar_forecast() -> dict:
             log.warning(f"Solar scalar fallback error: {exc}")
 
     return solar
-
 
 def _get_spot_prices() -> dict:
     """Returns {(hour, quarter_idx): EUR/kWh} from EPEX sensor attribute 'data'."""
