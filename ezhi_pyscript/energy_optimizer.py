@@ -102,7 +102,7 @@ MODE_IDS = {
 
 E_STATUS_MODE        = "input_text.energy_optimizer_mode"
 E_STATUS_REASON      = "input_text.energy_optimizer_reason"
-sol
+
 OUTLOOK_FILE         = "/config/www/energy_outlook.md"
 
 LOG_SOLAR_DEBUG      = False
