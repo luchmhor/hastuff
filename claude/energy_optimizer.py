@@ -795,6 +795,27 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     except Exception as exc:
         log.warning(f"Could not write outlook file: {exc}")
 
+def _debug_solar():
+    candidates = [
+        E_SOLAR_TODAY,
+        E_SOLAR_TOMORROW,
+        E_SOLAR_HOUR,
+    ]
+    for entity in candidates:
+        try:
+            raw_state = state.get(entity)
+            attrs     = state.getattr(entity) or {}
+            log.info(f"[solar debug] {entity} | state={raw_state} | attr_keys={list(attrs.keys())}")
+            for key in ["detailedForecast", "DetailedForecast", "forecast", "forecasts"]:
+                val = attrs.get(key)
+                if val is not None:
+                    count = len(val) if isinstance(val, list) else "not a list"
+                    first = val[0] if isinstance(val, list) and val else None
+                    log.info(f"[solar debug]   attr '{key}': {count} entries | first={first}")
+                else:
+                    log.info(f"[solar debug]   attr '{key}': not present")
+        except Exception as exc:
+            log.warning(f"[solar debug] error for {entity}: {exc}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — every 30 minutes
@@ -816,7 +837,7 @@ async def strategic_optimize():
         consumption = await _fetch_historical_consumption()
         solar       = _get_solar_forecast()
         prices      = _get_spot_prices()
-
+        _debug_solar()
         if not prices:
             log.warning("No EPEX price data available — mode unchanged")
             return
