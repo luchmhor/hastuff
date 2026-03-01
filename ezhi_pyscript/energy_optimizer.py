@@ -105,7 +105,7 @@ E_STATUS_REASON      = "input_text.energy_optimizer_reason"
 
 OUTLOOK_FILE         = "/config/www/energy_outlook.md"
 
-LOG_SOLAR_DEBUG      = False
+LOG_DEBUG            = False
 
 TZ                   = pytz.timezone("Europe/Vienna")
 
@@ -262,7 +262,7 @@ def _get_solar_forecast() -> dict:
             f"Solar forecast: {len(solar)} hours, "
             f"peak {peak_val:.0f}W at {peak_hour:02d}:00"
         )
-        if LOG_SOLAR_DEBUG:
+        if LOG_DEBUG:
             for h in sorted(solar.keys()):
                 if solar[h] > 0:
                     log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W")
@@ -710,8 +710,9 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         )
 
     log_lines.append("────────────────────────────────────────────────────────────────")
-    for line in log_lines:
-        log.info(line)
+    if LOG_DEBUG:
+        for line in log_lines:
+            log.info(line)
 
     # ── Write Markdown file ────────────────────
     try:
