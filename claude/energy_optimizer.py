@@ -54,6 +54,7 @@ Only file needed:
 """
 
 import aiohttp
+import asyncio
 import builtins
 import pytz
 from datetime import datetime, timedelta
@@ -215,20 +216,45 @@ def _fallback_consumption() -> dict:
 def _get_solar_forecast() -> dict:
     """
     Returns {hour: watts} for as many hours as Solcast provides.
-    Tries multiple known Solcast entity/attribute combinations.
+    Supports Solcast versions that store per-site forecasts as UUID-keyed
+    attributes on forecast_today / forecast_tomorrow sensors.
     Handles both string and pre-parsed datetime period_start values.
     """
     solar = {}
 
-    candidates = [
-        E_SOLAR_TODAY,
-        E_SOLAR_TOMORROW,
-        E_SOLAR_HOUR,
-    ]
+    SKIP_KEYS = {
+        "estimate", "estimate10", "estimate90",
+        "unit_of_measurement", "attribution",
+        "device_class", "friendly_name",
+        "icon", "state_class",
+    }
 
-    for entity in candidates:
+    def _parse_entries(fl):
+        result = {}
+        for entry in fl:
+            t_raw = entry.get("period_start") or entry.get("PeriodStart")
+            pv_kw = float(
+                entry.get("pv_estimate")
+                or entry.get("PvEstimate")
+                or 0
+            )
+            if t_raw is None:
+                continue
+            if isinstance(t_raw, str):
+                t = datetime.fromisoformat(t_raw).astimezone(TZ)
+            else:
+                try:
+                    t = t_raw.astimezone(TZ)
+                except Exception:
+                    t = datetime(*t_raw.timetuple()[:6], tzinfo=TZ)
+            result[t.hour] = result.get(t.hour, 0.0) + pv_kw * 1000
+        return result
+
+    for entity in [E_SOLAR_TODAY, E_SOLAR_TOMORROW]:
         try:
             attrs = state.getattr(entity) or {}
+
+            # Try known list attribute names first
             fl = (
                 attrs.get("detailedForecast")
                 or attrs.get("DetailedForecast")
@@ -236,30 +262,19 @@ def _get_solar_forecast() -> dict:
                 or attrs.get("forecasts")
                 or []
             )
-            if not fl:
-                continue
 
-            for entry in fl:
-                t_raw = entry.get("period_start") or entry.get("PeriodStart")
-                pv_kw = float(
-                    entry.get("pv_estimate")
-                    or entry.get("PvEstimate")
-                    or 0
-                )
-                if t_raw is None:
-                    continue
-
-                # Handle both pre-parsed datetime and ISO string
-                if isinstance(t_raw, str):
-                    t = datetime.fromisoformat(t_raw).astimezone(TZ)
-                else:
-                    try:
-                        t = t_raw.astimezone(TZ)
-                    except Exception:
-                        t = datetime(*t_raw.timetuple()[:6], tzinfo=TZ)
-
-                # Accumulate — Solcast uses 30-min slots, two per hour
-                solar[t.hour] = solar.get(t.hour, 0.0) + pv_kw * 1000
+            if fl:
+                solar = _parse_entries(fl)
+            else:
+                # Scan all attributes for UUID-keyed per-site forecast lists
+                for key, val in attrs.items():
+                    if key in SKIP_KEYS or key.startswith("estimate"):
+                        continue
+                    if isinstance(val, list) and val and isinstance(val[0], dict):
+                        log.info(f"Solar: using attr '{key}' on {entity}")
+                        parsed = _parse_entries(val)
+                        for h, w in parsed.items():
+                            solar[h] = solar.get(h, 0.0) + w
 
             if solar:
                 peak_hour = max(solar, key=solar.get)
@@ -269,16 +284,17 @@ def _get_solar_forecast() -> dict:
                     f"peak {max(solar.values()):.0f}W at "
                     f"{peak_hour:02d}:00"
                 )
-                # Log full profile for verification
                 for h in sorted(solar.keys()):
                     if solar[h] > 0:
                         log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W")
-                break
+                # Don't break — also load tomorrow to extend horizon
+                if entity == E_SOLAR_TOMORROW:
+                    break
 
         except Exception as exc:
             log.warning(f"Solar forecast error for {entity}: {exc}")
 
-    # Last resort: scalar value from E_SOLAR_HOUR for current hour only
+    # Last resort scalar fallback
     if not solar:
         try:
             val = float(state.get(E_SOLAR_HOUR) or 0)
@@ -291,6 +307,7 @@ def _get_solar_forecast() -> dict:
             log.warning(f"Solar scalar fallback error: {exc}")
 
     return solar
+
 
 def _get_spot_prices() -> dict:
     """Returns {(hour, quarter_idx): EUR/kWh} from EPEX sensor attribute 'data'."""
@@ -610,7 +627,7 @@ def _update_status(mode: str, reason: str):
 # 24H OUTLOOK LOGGER + FILE WRITER
 # ════════════════════════════════════════════════════════════════════════════
 
-def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
+async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     """
     Logs a human-readable 24h operational outlook by merging consecutive
     slots with the same planned action into labelled time windows.
@@ -806,36 +823,17 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     for line in log_lines:
         log.info(line)
 
-    # ── Write Markdown file for Lovelace ──────────────────────────────────
+    # ── Write Markdown file for Lovelace (non-blocking) ───────────────────
     try:
-        import builtins
-        with builtins.open(OUTLOOK_FILE, "w", encoding="utf-8") as f:
-            f.write("\n".join(md_lines))
+        content = "\n".join(md_lines)
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: builtins.open(OUTLOOK_FILE, "w", encoding="utf-8").write(content)
+        )
         log.info(f"Outlook written to {OUTLOOK_FILE}")
     except Exception as exc:
         log.warning(f"Could not write outlook file: {exc}")
 
-def _debug_solar():
-    candidates = [
-        E_SOLAR_TODAY,
-        E_SOLAR_TOMORROW,
-        E_SOLAR_HOUR,
-    ]
-    for entity in candidates:
-        try:
-            raw_state = state.get(entity)
-            attrs     = state.getattr(entity) or {}
-            log.info(f"[solar debug] {entity} | state={raw_state} | attr_keys={list(attrs.keys())}")
-            for key in ["detailedForecast", "DetailedForecast", "forecast", "forecasts"]:
-                val = attrs.get(key)
-                if val is not None:
-                    count = len(val) if isinstance(val, list) else "not a list"
-                    first = val[0] if isinstance(val, list) and val else None
-                    log.info(f"[solar debug]   attr '{key}': {count} entries | first={first}")
-                else:
-                    log.info(f"[solar debug]   attr '{key}': not present")
-        except Exception as exc:
-            log.warning(f"[solar debug] error for {entity}: {exc}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — every 30 minutes
@@ -857,7 +855,7 @@ async def strategic_optimize():
         consumption = await _fetch_historical_consumption()
         solar       = _get_solar_forecast()
         prices      = _get_spot_prices()
-        _debug_solar()
+
         if not prices:
             log.warning("No EPEX price data available — mode unchanged")
             return
@@ -867,146 +865,4 @@ async def strategic_optimize():
 
         _ctx["last_schedule"] = optimal_schedule
 
-        raw_sp = optimal_schedule[0] if optimal_schedule else 0
-        net    = schedule[0]["net"]   if schedule         else 0.0
-        price  = schedule[0]["price"] if schedule         else 0.15
-
-        mode, sp = _apply_trickle_override(soc, raw_sp, net)
-
-        _write_outputs(mode, sp)
-
-        # ── Build dashboard reason string ─────────────────────────────────
-        p25 = _ctx.get("p25", 0.10)
-        p75 = _ctx.get("p75", 0.20)
-
-        if mode == "GRID_CHARGE":
-            reason = (
-                f"Price {price * 100:.1f} ct/kWh is in cheapest 25% "
-                f"(≤ {p25 * 100:.1f} ct). "
-                f"Charging battery at max rate ({OUTPUT_MIN_W}W) to store cheap "
-                f"energy for later. SOC: {soc:.0f}%."
-            )
-        elif mode == "DISCHARGE":
-            reason = (
-                f"Price {price * 100:.1f} ct/kWh is in most expensive 25% "
-                f"(≥ {p75 * 100:.1f} ct). "
-                f"Discharging battery ({sp:+d}W) to cover apartment load and avoid "
-                f"buying expensive grid power. SOC: {soc:.0f}%."
-            )
-        elif mode == "TRICKLE" and soc >= BATTERY_FULL_PCT:
-            reason = (
-                f"Battery full ({soc:.0f}%). Gently increasing output to prevent "
-                f"trickle charging above {BATTERY_FULL_PCT}%. "
-                f"Holding SOC in {BATTERY_TRICKLE_PCT}–{BATTERY_FULL_PCT}% band. "
-                f"Price: {price * 100:.1f} ct/kWh."
-            )
-        elif mode == "TRICKLE":
-            reason = (
-                f"SOC {soc:.0f}% is in hysteresis band "
-                f"({BATTERY_TRICKLE_PCT}–{BATTERY_FULL_PCT}%). "
-                f"Gently recharging to keep battery near full. "
-                f"Price: {price * 100:.1f} ct/kWh."
-            )
-        elif mode == "BALANCE" and soc >= BATTERY_FULL_PCT and net < -GRID_DEADZONE_W:
-            reason = (
-                f"Battery full ({soc:.0f}%) with PV surplus of {abs(net):.0f}W. "
-                f"Spilling minimum surplus ({sp:+d}W) to grid to prevent PV "
-                f"curtailment. Price: {price * 100:.1f} ct/kWh."
-            )
-        else:
-            if USE_LP_OPTIMIZER:
-                reason = (
-                    f"LP optimizer: no strong charge/discharge signal at "
-                    f"{price * 100:.1f} ct/kWh "
-                    f"[P25={p25 * 100:.1f} P75={p75 * 100:.1f} ct]. "
-                    f"Consuming from grid. SOC: {soc:.0f}%. "
-                    f"Slot-0 guidance: {raw_sp:+d}W."
-                )
-            else:
-                fv       = _assess_future_value(schedule, p75)
-                pvc      = _estimate_pv_recharge(schedule, p75)
-                avail_wh = max(0.0, (soc - BATTERY_EMPTY_PCT) / 100.0 * BATTERY_SIZE_WH)
-                if (fv["high_demand_wh"] > 0
-                        and avail_wh >= fv["high_demand_wh"]
-                        and pvc < fv["high_demand_wh"]):
-                    reason = (
-                        f"Mid price ({price * 100:.1f} ct/kWh). Holding battery for "
-                        f"upcoming expensive window ({fv['slots']} slots, "
-                        f"{fv['high_demand_wh']:.0f}Wh needed). "
-                        f"PV recharge forecast ({pvc:.0f}Wh) insufficient. "
-                        f"SOC: {soc:.0f}% ({avail_wh:.0f}Wh available)."
-                    )
-                elif fv["high_demand_wh"] > 0:
-                    reason = (
-                        f"Mid price ({price * 100:.1f} ct/kWh). Expensive window ahead "
-                        f"({fv['slots']} slots, {fv['high_demand_wh']:.0f}Wh). "
-                        f"PV forecast ({pvc:.0f}Wh) will recharge battery in time — "
-                        f"discharging freely. SOC: {soc:.0f}%."
-                    )
-                else:
-                    reason = (
-                        f"Mid price ({price * 100:.1f} ct/kWh). No high-value window "
-                        f"ahead. Consuming from grid. SOC: {soc:.0f}%."
-                    )
-
-        _update_status(mode, reason)
-
-        log.info(
-            f"Mode={mode} | SOC={soc:.0f}% | "
-            f"Price={price * 100:.1f} ct/kWh | "
-            f"Optimizer={raw_sp:+d}W → Applied={sp:+d}W"
-        )
-
-        # Log and write 24h outlook once per hour (first cycle of each hour)
-        now = datetime.now(TZ)
-        if now.minute < 30:
-            _log_24h_outlook(schedule, optimal_schedule, soc)
-
-    except Exception as exc:
-        import traceback
-        log.error(f"Strategic error: {exc}\n{traceback.format_exc()}")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# EVENT TRIGGERS
-# ════════════════════════════════════════════════════════════════════════════
-
-@state_trigger(E_PRICE_DATA)
-async def on_price_update(**kwargs):
-    """Re-run strategic cycle immediately when EPEX prices update (~17:00)."""
-    log.info("EPEX price data updated — triggering strategic cycle")
-    await strategic_optimize()
-
-
-@state_trigger(E_BATTERY_SOC)
-def on_soc_critical(**kwargs):
-    """Force inverter to 0 W and BALANCE mode if SOC drops below 12%."""
-    soc_raw = state.get(E_BATTERY_SOC)
-    if soc_raw in (None, "unavailable", "unknown"):
-        return
-    if float(soc_raw) < 12:
-        input_number.set_value(entity_id=E_MODE_ID,  value=0)
-        input_number.set_value(entity_id=E_SETPOINT, value=0)
-        _update_status(
-            "BALANCE",
-            f"⚠️ Emergency: SOC critically low ({soc_raw}%). "
-            f"Inverter forced to 0W. Optimizer resumes at next 30-min cycle."
-        )
-        persistent_notification.create(
-            title="⚠️ Battery Critical",
-            message=f"SOC is {soc_raw}% — inverter forced to 0 W. "
-                    f"Optimizer resumes at next 30-min strategic cycle.",
-            notification_id="energy_optimizer_critical",
-        )
-        log.warning(f"Battery critical ({soc_raw}%) — mode forced to BALANCE, setpoint 0W")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# MANUAL SERVICE CALL
-# ════════════════════════════════════════════════════════════════════════════
-
-@service
-async def energy_optimizer_force_run():
-    """Callable via Developer Tools → Actions → pyscript.energy_optimizer_force_run"""
-    log.info("Manual trigger — running strategic cycle now")
-    await strategic_optimize()
+        raw_sp = optimal_schedule[0]
