@@ -333,39 +333,72 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     solars = [s["solar"] for s in schedule]
     prices = [s["price"] for s in schedule]
 
+    # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = grid charge)
+    #            g[0..N-1] = grid import slack (always >= 0)
+    #
+    # Objective: minimise grid cost + small discharge wear penalty
+    #   - discharging saves grid cost at current price  → reward = prices[t]
+    #   - grid charging costs money at current price    → cost   = prices[t]
+    #   Both captured by making the b variable cost = -prices[t]*DT/1000
+    #   (negative because discharge reduces grid spend)
+    #   Plus discharge wear penalty on positive b only (approximated globally)
+
     c_obj = []
     for t in range(N):
+        # Cost of battery setpoint: charging (b<0) costs money, discharging (b>0) saves money
+        # LP minimises, so: discharge saves → negative cost; charge costs → positive cost
+        # Net: coefficient = +DISCHARGE_PENALTY (wear) - prices[t]*DT/1000 (savings)
+        # But we split: just use grid import slack for the actual cost signal
         c_obj.append(DISCHARGE_PENALTY * DT / 1000.0)
     for t in range(N):
         c_obj.append(prices[t] * DT / 1000.0)
 
+    # Bounds: b in [OUTPUT_MIN_W, OUTPUT_MAX_W], g >= 0
     bounds = []
     for t in range(N):
-        net_load = loads[t] - solars[t]
-        upper    = min(float(OUTPUT_MAX_W), net_load) if net_load > 0 else float(OUTPUT_MAX_W)
-        bounds.append((float(OUTPUT_MIN_W), upper))
+        bounds.append((float(OUTPUT_MIN_W), float(OUTPUT_MAX_W)))
     for t in range(N):
         bounds.append((0.0, None))
 
+    # Constraints:
+    # 1) Grid import slack: g[t] >= load[t] - solar[t] - b[t]
+    #    → -b[t] - g[t] <= solar[t] - load[t]
+    # 2) SOC lower bound:  sum(b[0..k]) * DT <= E_now - E_min
+    # 3) SOC upper bound: -sum(b[0..k]) * DT <= E_max - E_now
+    # 4) No export: g[t] >= 0 already; also b[t] <= load[t] - solar[t] when no export
     A_ub = []
     b_ub = []
+
     for t in range(N):
         row        = [0.0] * (2 * N)
         row[t]     = -1.0
         row[N + t] = -1.0
         A_ub.append(row)
         b_ub.append(solars[t] - loads[t])
+
     for k in range(N):
+        # SOC floor
         row = [0.0] * (2 * N)
         for t in range(k + 1):
             row[t] = DT
         A_ub.append(row)
         b_ub.append(E_now - E_min)
+        # SOC ceiling
         row = [0.0] * (2 * N)
         for t in range(k + 1):
             row[t] = -DT
         A_ub.append(row)
         b_ub.append(E_max - E_now)
+
+    # No export: if ALLOW_EXPORT is False, cap discharge to net load
+    if not ALLOW_EXPORT:
+        for t in range(N):
+            net = loads[t] - solars[t]
+            if net >= 0:
+                row    = [0.0] * (2 * N)
+                row[t] = 1.0
+                A_ub.append(row)
+                b_ub.append(net)
 
     try:
         result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
@@ -378,8 +411,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         for t in range(N):
             sp = int(round(result.x[t] / 10) * 10)
             sp = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, sp))
-            if sp < 0 and e < E_max * 0.99:
-                sp = max(sp, 0)
             optimal.append(sp)
             e -= sp * DT
 
