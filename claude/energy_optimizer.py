@@ -193,10 +193,6 @@ def _fallback_consumption() -> dict:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _get_solar_forecast() -> dict:
-    """
-    Returns {hour: watts} for the next 24h using Solcast detailedHourly.
-    pv_estimate is average kW for the hour → × 1000 = W.
-    """
     solar = {}
     now   = datetime.now(TZ)
 
@@ -249,10 +245,16 @@ def _get_solar_forecast() -> dict:
         log.warning(f"Solar tomorrow error: {exc}")
 
     if solar:
-        peak_hour = max(solar, key=solar.get)
+        # Find peak hour without key= lambda
+        peak_hour = None
+        peak_val  = -1
+        for h, w in solar.items():
+            if w > peak_val:
+                peak_val  = w
+                peak_hour = h
         log.info(
             f"Solar forecast: {len(solar)} hours, "
-            f"peak {max(solar.values()):.0f}W at {peak_hour:02d}:00"
+            f"peak {peak_val:.0f}W at {peak_hour:02d}:00"
         )
         for h in sorted(solar.keys()):
             if solar[h] > 0:
