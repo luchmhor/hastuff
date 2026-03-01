@@ -43,7 +43,7 @@ Requires in configuration.yaml:
 
   # Lovelace Markdown card:
   #   type: markdown
-  #   title: Energy Optimizer — 24h Outlook
+  #   title: Energy Optimizer —  Outlook
   #   content: "{{ states('sensor.energy_optimizer_outlook') }}"
 
 Only file needed:
@@ -381,7 +381,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
 
         log.info(
             f"LP solved ✓ | Slot-0={optimal[0]:+d}W | "
-            f"Expected 24h grid cost={total_cost:.4f} €"
+            f"Expected  grid cost={total_cost:.4f} €"
         )
         return optimal
 
@@ -547,19 +547,18 @@ def _update_status(mode: str, reason: str):
 # ════════════════════════════════════════════════════════════════════════════
 
 def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
-    """
-    Logs a human-readable 24h operational outlook by merging consecutive
-    slots with the same planned action into labelled time windows.
-    Also writes a Markdown file for the Lovelace command_line sensor card.
-    Called once per hour from strategic_optimize().
-    """
     if not schedule or not optimal_schedule:
         log.info("Outlook: no schedule available")
         return
 
-    p75 = _ctx.get("p75", 0.20)
+    p75   = _ctx.get("p75", 0.20)
+    DT    = 0.25
+    E_now = soc / 100.0 * BATTERY_SIZE_WH
+    E_min = BATTERY_EMPTY_PCT / 100.0 * BATTERY_SIZE_WH
+    E_max = BATTERY_FULL_PCT  / 100.0 * BATTERY_SIZE_WH
 
     slots = []
+    e     = E_now
     for i in range(len(schedule)):
         if i >= len(optimal_schedule):
             break
@@ -567,6 +566,15 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         sp = optimal_schedule[i]
         p  = s["price"]
         n  = s["net"]
+
+        e_after   = e - sp * DT
+        e_after   = max(E_min, min(E_max, e_after))
+        soc_after = e_after / BATTERY_SIZE_WH * 100.0
+
+        pv_w    = s["solar"]
+        cons_w  = s["cons"]
+        batt_w  = sp
+        grid_w  = max(0.0, n - sp)
 
         if sp <= -GRID_DEADZONE_W:
             label = "GRID_CHARGE"
@@ -580,67 +588,71 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
             label = "GRID_CONSUMPTION"
 
         slots.append({
-            "time":  s["time"],
-            "label": label,
-            "price": p,
-            "net":   n,
-            "sp":    sp,
+            "time":    s["time"],
+            "label":   label,
+            "price":   p,
+            "net":     n,
+            "sp":      sp,
+            "cons_w":  cons_w,
+            "pv_w":    pv_w,
+            "batt_w":  batt_w,
+            "grid_w":  grid_w,
+            "soc_pct": soc_after,
         })
+        e = e_after
 
     windows = []
     if not slots:
         return
 
-    cur_label  = slots[0]["label"]
-    cur_start  = slots[0]["time"]
-    cur_prices = [slots[0]["price"]]
-    cur_sp     = [slots[0]["sp"]]
-    cur_net    = [slots[0]["net"]]
+    def _new_window(slot):
+        return {
+            "label":   slot["label"],
+            "start":   slot["time"],
+            "prices":  [slot["price"]],
+            "sp":      [slot["sp"]],
+            "net":     [slot["net"]],
+            "cons_w":  [slot["cons_w"]],
+            "pv_w":    [slot["pv_w"]],
+            "batt_w":  [slot["batt_w"]],
+            "grid_w":  [slot["grid_w"]],
+            "soc_pct": [slot["soc_pct"]],
+            "n_slots": 1,
+        }
+
+    cur = _new_window(slots[0])
 
     for slot in slots[1:]:
-        if slot["label"] == cur_label:
-            cur_prices.append(slot["price"])
-            cur_sp.append(slot["sp"])
-            cur_net.append(slot["net"])
+        if slot["label"] == cur["label"]:
+            cur["prices"].append(slot["price"])
+            cur["sp"].append(slot["sp"])
+            cur["net"].append(slot["net"])
+            cur["cons_w"].append(slot["cons_w"])
+            cur["pv_w"].append(slot["pv_w"])
+            cur["batt_w"].append(slot["batt_w"])
+            cur["grid_w"].append(slot["grid_w"])
+            cur["soc_pct"].append(slot["soc_pct"])
+            cur["n_slots"] += 1
         else:
-            windows.append({
-                "label":     cur_label,
-                "start":     cur_start,
-                "end":       slot["time"],
-                "avg_price": sum(cur_prices) / len(cur_prices),
-                "min_price": min(cur_prices),
-                "max_price": max(cur_prices),
-                "avg_sp":    sum(cur_sp) / len(cur_sp),
-                "avg_net":   sum(cur_net) / len(cur_net),
-                "n_slots":   len(cur_prices),
-            })
-            cur_label  = slot["label"]
-            cur_start  = slot["time"]
-            cur_prices = [slot["price"]]
-            cur_sp     = [slot["sp"]]
-            cur_net    = [slot["net"]]
+            cur["end"] = slot["time"]
+            windows.append(cur)
+            cur = _new_window(slot)
 
-    windows.append({
-        "label":     cur_label,
-        "start":     cur_start,
-        "end":       cur_start + timedelta(minutes=15 * len(cur_prices)),
-        "avg_price": sum(cur_prices) / len(cur_prices),
-        "min_price": min(cur_prices),
-        "max_price": max(cur_prices),
-        "avg_sp":    sum(cur_sp) / len(cur_sp),
-        "avg_net":   sum(cur_net) / len(cur_net),
-        "n_slots":   len(cur_prices),
-    })
+    cur["end"] = cur["start"] + timedelta(minutes=15 * cur["n_slots"])
+    windows.append(cur)
+
+    def _avg(lst):
+        return sum(lst) / len(lst)
 
     label_text = {
         "GRID_CHARGE":      "⚡ Charge from grid",
         "DISCHARGE_PEAK":   "🔋 Discharge (peak price)",
-        "COVER_LOAD":       "⚖️ Cover load",
-        "PV_SURPLUS":       "☀️ PV surplus / spill",
+        "COVER_LOAD":       "⚖️  Cover load",
+        "PV_SURPLUS":       "☀️  PV surplus / spill",
         "GRID_CONSUMPTION": "🏭 Grid consumption",
     }
 
-    # ── Log lines (unchanged behaviour) ───────────────────────────────────
+    # ── Log lines ─────────────────────────────────────────────────────────
     log_lines = []
     log_lines.append(
         f"─── 24h Outlook ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) | "
@@ -648,7 +660,7 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         f"P25={_ctx.get('p25', 0):.4f} P75={_ctx.get('p75', 0):.4f} €/kWh ───"
     )
 
-    # ── Markdown lines (for Lovelace card) ────────────────────────────────
+    # ── Markdown lines ────────────────────────────────────────────────────
     now_str = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
     md_lines = []
     md_lines.append(
@@ -658,8 +670,8 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         f"<small>_(updated {now_str})_</small>"
     )
     md_lines.append("")
-    md_lines.append("| Time | Strategy | Price |")
-    md_lines.append("|------|----------|-------|")
+    md_lines.append("| Time | Strategy | Price | Consumption | PV forecast | Grid import | PV/Batt output | SOC end |")
+    md_lines.append("|------|----------|-------|-------------|-------------|-------------|----------------|---------|")
 
     for w in windows:
         start_str = w["start"].strftime("%H:%M")
@@ -667,31 +679,41 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         duration  = w["n_slots"] * 15
         desc      = label_text.get(w["label"], w["label"])
 
-        if abs(w["min_price"] - w["max_price"]) < 0.0001:
-            price_str = f"{w['avg_price']:.4f} €/kWh"
-        else:
-            price_str = (
-                f"{w['avg_price']:.4f} €/kWh "
-                f"({w['min_price']:.4f}–{w['max_price']:.4f})"
-            )
+        avg_price = _avg(w["prices"])
+        min_price = min(w["prices"])
+        max_price = max(w["prices"])
+        avg_cons  = _avg(w["cons_w"])
+        avg_pv    = _avg(w["pv_w"])
+        avg_grid  = _avg(w["grid_w"])
+        avg_batt  = _avg(w["batt_w"])
+        soc_end   = w["soc_pct"][-1]
 
-        if w["label"] == "GRID_CHARGE":
-            detail = f"avg {w['avg_sp']:.0f}W from grid"
-        elif w["label"] in ("DISCHARGE_PEAK", "COVER_LOAD"):
-            detail = f"avg {w['avg_sp']:.0f}W | net {w['avg_net']:.0f}W"
-        elif w["label"] == "PV_SURPLUS":
-            detail = f"avg {abs(w['avg_net']):.0f}W surplus"
-        else:
-            detail = f"net {w['avg_net']:+.0f}W"
+        avg_pv_batt = avg_pv + max(0.0, avg_batt)
 
-        log_line = (
+        if abs(min_price - max_price) < 0.0001:
+            price_str = f"{avg_price:.4f} €"
+        else:
+            price_str = f"{avg_price:.4f} € ({min_price:.4f}–{max_price:.4f})"
+
+        log_lines.append(
             f"  {start_str}–{end_str} ({duration:3d}min)  "
-            f"{desc:<32}  {price_str:<48}  {detail}"
+            f"{desc:<32}  {price_str:<28}  "
+            f"cons {avg_cons:.0f}W  "
+            f"pv {avg_pv:.0f}W  "
+            f"grid {avg_grid:.0f}W  "
+            f"pv/batt {avg_pv_batt:.0f}W  "
+            f"SOC→{soc_end:.0f}%"
         )
-        log_lines.append(log_line)
 
         md_lines.append(
-            f"| `{start_str}–{end_str}` ({duration}min) | {desc} | {price_str} |"
+            f"| `{start_str}–{end_str}` ({duration}min) "
+            f"| {desc} "
+            f"| {price_str} "
+            f"| {avg_cons:.0f} W "
+            f"| {avg_pv:.0f} W "
+            f"| {avg_grid:.0f} W "
+            f"| {avg_pv_batt:.0f} W "
+            f"| {soc_end:.0f}% |"
         )
 
     log_lines.append(
@@ -709,6 +731,7 @@ def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         log.info(f"Outlook written to {OUTLOOK_FILE}")
     except Exception as exc:
         log.warning(f"Could not write outlook file: {exc}")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — every 30 minutes
