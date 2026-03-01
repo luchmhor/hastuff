@@ -715,13 +715,15 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
     # ── Write Markdown file ────────────────────
     try:
+        import io
+        import os
         content = "\n".join(md_lines)
-        with open(OUTLOOK_FILE, "w", encoding="utf-8") as f:
-            f.write(content)
+        fd = os.open(OUTLOOK_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with io.FileIO(fd, "w") as raw:
+            raw.write(content.encode("utf-8"))
         log.info(f"Outlook written to {OUTLOOK_FILE}")
     except Exception as exc:
         log.warning(f"Could not write outlook file: {exc}")
-
 
 
 # ════════════════════════════════════════════════════════════════════════════
