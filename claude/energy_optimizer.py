@@ -195,14 +195,12 @@ def _fallback_consumption() -> dict:
 def _get_solar_forecast() -> dict:
     """
     Returns {hour: watts} for the next 24h using Solcast detailedHourly.
-    Keys are wall-clock hours (0-23). Today's remaining hours come from
-    forecast_today, tomorrow's hours from forecast_tomorrow.
     pv_estimate is average kW for the hour → × 1000 = W.
     """
     solar = {}
     now   = datetime.now(TZ)
 
-    def _parse_hourly(fl, only_from_date=None):
+    def _parse_hourly(fl, filter_date=None):
         result = {}
         for entry in fl:
             t_raw = entry.get("period_start")
@@ -216,44 +214,44 @@ def _get_solar_forecast() -> dict:
                     t = t_raw.astimezone(TZ)
                 except Exception:
                     t = datetime(*t_raw.timetuple()[:6], tzinfo=TZ)
-            # Filter by date if specified
-            if only_from_date and t.date() != only_from_date:
+            if filter_date is not None and t.date() != filter_date:
                 continue
             result[t.hour] = pv_kw * 1000
         return result
 
-    # Load today's remaining hours from forecast_today
+    # Load today's remaining hours
     try:
-        attrs   = state.getattr(E_SOLAR_TODAY) or {}
-        fl      = attrs.get("detailedHourly") or []
-        parsed  = _parse_hourly(fl, only_from_date=now.date())
+        attrs  = state.getattr(E_SOLAR_TODAY) or {}
+        fl     = attrs.get("detailedHourly") or []
+        parsed = _parse_hourly(fl, filter_date=now.date())
+        count  = 0
         for h, w in parsed.items():
             if h >= now.hour:
                 solar[h] = w
-        log.info(f"Solar today: {len(parsed)} slots, loaded {sum(1 for h in parsed if h >= now.hour)} remaining hours")
+                count += 1
+        log.info(f"Solar today: {count} remaining hours loaded")
     except Exception as exc:
         log.warning(f"Solar today error: {exc}")
 
-    # Fill tomorrow's hours from forecast_tomorrow
+    # Fill tomorrow's hours
     try:
-        from datetime import date, timedelta as td
-        tomorrow = (now + td(days=1)).date()
+        tomorrow = (now + timedelta(days=1)).date()
         attrs    = state.getattr(E_SOLAR_TOMORROW) or {}
         fl       = attrs.get("detailedHourly") or []
-        parsed   = _parse_hourly(fl, only_from_date=tomorrow)
+        parsed   = _parse_hourly(fl, filter_date=tomorrow)
         count    = 0
         for h, w in parsed.items():
             if h not in solar:
                 solar[h] = w
                 count += 1
-        log.info(f"Solar tomorrow: filled {count} hours")
+        log.info(f"Solar tomorrow: {count} hours filled")
     except Exception as exc:
         log.warning(f"Solar tomorrow error: {exc}")
 
     if solar:
         peak_hour = max(solar, key=solar.get)
         log.info(
-            f"Solar forecast final: {len(solar)} hours, "
+            f"Solar forecast: {len(solar)} hours, "
             f"peak {max(solar.values()):.0f}W at {peak_hour:02d}:00"
         )
         for h in sorted(solar.keys()):
@@ -270,8 +268,6 @@ def _get_solar_forecast() -> dict:
         log.warning(f"Solar scalar fallback error: {exc}")
 
     return solar
-
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # SPOT PRICES + SCHEDULE
