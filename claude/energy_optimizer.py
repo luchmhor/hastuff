@@ -194,13 +194,15 @@ def _fallback_consumption() -> dict:
 
 def _get_solar_forecast() -> dict:
     """
-    Returns {hour: watts} using Solcast detailedHourly attribute.
-    pv_estimate is in kW — multiply by 1000 to get watts.
-    Loads today first, fills remaining hours from tomorrow.
+    Returns {hour: watts} for the next 24h using Solcast detailedHourly.
+    Keys are wall-clock hours (0-23). Today's remaining hours come from
+    forecast_today, tomorrow's hours from forecast_tomorrow.
+    pv_estimate is average kW for the hour → × 1000 = W.
     """
     solar = {}
+    now   = datetime.now(TZ)
 
-    def _parse_hourly(fl):
+    def _parse_hourly(fl, only_from_date=None):
         result = {}
         for entry in fl:
             t_raw = entry.get("period_start")
@@ -214,31 +216,46 @@ def _get_solar_forecast() -> dict:
                     t = t_raw.astimezone(TZ)
                 except Exception:
                     t = datetime(*t_raw.timetuple()[:6], tzinfo=TZ)
+            # Filter by date if specified
+            if only_from_date and t.date() != only_from_date:
+                continue
             result[t.hour] = pv_kw * 1000
         return result
 
-    for entity in [E_SOLAR_TODAY, E_SOLAR_TOMORROW]:
-        try:
-            attrs = state.getattr(entity) or {}
-            fl    = attrs.get("detailedHourly") or []
-            if fl:
-                parsed = _parse_hourly(fl)
-                for h, w in parsed.items():
-                    if h not in solar:
-                        solar[h] = w
-                peak_hour = max(solar, key=solar.get) if solar else 0
-                log.info(
-                    f"Solar loaded from {entity}: "
-                    f"{len(solar)} hours, "
-                    f"peak {max(solar.values()) if solar else 0:.0f}W "
-                    f"at {peak_hour:02d}:00"
-                )
-            else:
-                log.warning(f"Solar: no detailedHourly on {entity}")
-        except Exception as exc:
-            log.warning(f"Solar forecast error for {entity}: {exc}")
+    # Load today's remaining hours from forecast_today
+    try:
+        attrs   = state.getattr(E_SOLAR_TODAY) or {}
+        fl      = attrs.get("detailedHourly") or []
+        parsed  = _parse_hourly(fl, only_from_date=now.date())
+        for h, w in parsed.items():
+            if h >= now.hour:
+                solar[h] = w
+        log.info(f"Solar today: {len(parsed)} slots, loaded {sum(1 for h in parsed if h >= now.hour)} remaining hours")
+    except Exception as exc:
+        log.warning(f"Solar today error: {exc}")
+
+    # Fill tomorrow's hours from forecast_tomorrow
+    try:
+        from datetime import date, timedelta as td
+        tomorrow = (now + td(days=1)).date()
+        attrs    = state.getattr(E_SOLAR_TOMORROW) or {}
+        fl       = attrs.get("detailedHourly") or []
+        parsed   = _parse_hourly(fl, only_from_date=tomorrow)
+        count    = 0
+        for h, w in parsed.items():
+            if h not in solar:
+                solar[h] = w
+                count += 1
+        log.info(f"Solar tomorrow: filled {count} hours")
+    except Exception as exc:
+        log.warning(f"Solar tomorrow error: {exc}")
 
     if solar:
+        peak_hour = max(solar, key=solar.get)
+        log.info(
+            f"Solar forecast final: {len(solar)} hours, "
+            f"peak {max(solar.values()):.0f}W at {peak_hour:02d}:00"
+        )
         for h in sorted(solar.keys()):
             if solar[h] > 0:
                 log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W")
@@ -247,12 +264,13 @@ def _get_solar_forecast() -> dict:
     # Last resort scalar fallback
     try:
         val = float(state.get(E_SOLAR_HOUR) or 0)
-        solar[datetime.now(TZ).hour] = val
+        solar[now.hour] = val
         log.warning(f"Solcast fallback: {val}W for current hour only")
     except Exception as exc:
         log.warning(f"Solar scalar fallback error: {exc}")
 
     return solar
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
