@@ -733,6 +733,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         log.warning(f"Could not write outlook file: {exc}")
 
 
+
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — every 30 minutes
 # ════════════════════════════════════════════════════════════════════════════
