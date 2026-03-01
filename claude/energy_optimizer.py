@@ -195,21 +195,12 @@ def _fallback_consumption() -> dict:
 def _get_solar_forecast() -> dict:
     solar = {}
 
-    SKIP_KEYS = {
-        "estimate", "estimate10", "estimate90",
-        "unit_of_measurement", "attribution",
-        "device_class", "friendly_name",
-        "icon", "state_class",
-    }
-
-    def _parse_entries(fl):
-        """Returns {hour: avg_watts} — averages multiple slots per hour."""
-        buckets = {}   # {hour: [watts, ...]}
+    def _parse_hourly(fl):
+        """Parse detailedHourly — one entry per hour, pv_estimate in kW."""
+        result = {}
         for entry in fl:
-            t_raw = entry.get("period_start") or entry.get("PeriodStart")
-            pv_kw = float(
-                entry.get("pv_estimate") or entry.get("PvEstimate") or 0
-            )
+            t_raw = entry.get("period_start")
+            pv_kw = float(entry.get("pv_estimate") or 0)
             if t_raw is None:
                 continue
             if isinstance(t_raw, str):
@@ -219,46 +210,35 @@ def _get_solar_forecast() -> dict:
                     t = t_raw.astimezone(TZ)
                 except Exception:
                     t = datetime(*t_raw.timetuple()[:6], tzinfo=TZ)
-            buckets.setdefault(t.hour, []).append(pv_kw * 1000)
-        # Average watts across all slots in the hour
-        return {h: sum(v) / len(v) for h, v in buckets.items()}
+            result[t.hour] = pv_kw * 1000  # kW → W
+        return result
 
-    # Load today first, then fill remaining hours from tomorrow
     for entity in [E_SOLAR_TODAY, E_SOLAR_TOMORROW]:
         try:
             attrs = state.getattr(entity) or {}
-            fl = (
-                attrs.get("detailedForecast")
-                or attrs.get("DetailedForecast")
-                or attrs.get("forecast")
-                or attrs.get("forecasts")
-                or []
-            )
-            if not fl:
-                for key, val in attrs.items():
-                    if key in SKIP_KEYS or key.startswith("estimate"):
-                        continue
-                    if isinstance(val, list) and val and isinstance(val[0], dict):
-                        log.info(f"Solar: using attr '{key}' on {entity}")
-                        fl = val
-                        break
+
+            # Prefer detailedHourly — one entry per hour, no averaging needed
+            fl = attrs.get("detailedHourly") or []
 
             if fl:
-                parsed = _parse_entries(fl)
-                # Only add hours not already covered by today
+                parsed = _parse_hourly(fl)
                 for h, w in parsed.items():
-                    if h not in solar:
+                    if h not in solar:   # today fills first, tomorrow fills gaps
                         solar[h] = w
+                if solar:
+                    peak_hour = max(solar, key=solar.get)
+                    log.info(
+                        f"Solar forecast loaded from {entity}: "
+                        f"{len(solar)} hours, "
+                        f"peak {max(solar.values()):.0f}W at {peak_hour:02d}:00"
+                    )
+            else:
+                log.warning(f"Solar: no detailedHourly attribute on {entity}")
 
         except Exception as exc:
             log.warning(f"Solar forecast error for {entity}: {exc}")
 
     if solar:
-        peak_hour = max(solar, key=solar.get)
-        log.info(
-            f"Solar forecast: {len(solar)} hours, "
-            f"peak {max(solar.values()):.0f}W at {peak_hour:02d}:00"
-        )
         for h in sorted(solar.keys()):
             if solar[h] > 0:
                 log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W")
@@ -273,6 +253,7 @@ def _get_solar_forecast() -> dict:
         log.warning(f"Solar scalar fallback error: {exc}")
 
     return solar
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
