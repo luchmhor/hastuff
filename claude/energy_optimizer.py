@@ -420,8 +420,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
 
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # HEURISTIC OPTIMIZER
 # ════════════════════════════════════════════════════════════════════════════
