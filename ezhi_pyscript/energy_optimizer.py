@@ -513,7 +513,11 @@ def _mode_from_setpoint(sp: int) -> str:
         return "BALANCE"
 
 
-def _apply_trickle_override(soc: float, sp: int, net: float) -> tuple:
+def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tuple:
+    p75 = _ctx.get("p75", 0.20)
+    # Skip trickle logic entirely during peak prices — let LP decide
+    if price >= p75:
+        return (_mode_from_setpoint(sp), sp)
     if soc >= BATTERY_FULL_PCT:
         if net < -GRID_DEADZONE_W:
             return ("BALANCE", max(0, min(OUTPUT_MAX_W, int(net * -1))))
@@ -523,7 +527,6 @@ def _apply_trickle_override(soc: float, sp: int, net: float) -> tuple:
         return ("TRICKLE", -BATTERY_TRICKLE_W)
     else:
         return (_mode_from_setpoint(sp), sp)
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # HA OUTPUT HELPERS
@@ -762,7 +765,7 @@ async def strategic_optimize():
         net    = schedule[0]["net"]   if schedule         else 0.0
         price  = schedule[0]["price"] if schedule         else 0.15
 
-        mode, sp = _apply_trickle_override(soc, raw_sp, net)
+        mode, sp = _apply_trickle_override(soc, raw_sp, net, price)
         _write_outputs(mode, sp)
 
         p25 = _ctx.get("p25", 0.10)
