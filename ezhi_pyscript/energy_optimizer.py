@@ -587,7 +587,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         if sp <= -GRID_DEADZONE_W:
             label = "GRID_CHARGE"
         elif sp >= GRID_DEADZONE_W and p >= p75:
-            label = "DISCHARGE_PEAK"
+            label = "COVER_LOAD_PEAK"
         elif sp >= GRID_DEADZONE_W and p < p75:
             label = "COVER_LOAD"
         elif n < -GRID_DEADZONE_W:
@@ -653,7 +653,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
     label_text = {
         "GRID_CHARGE":      "⚡ Charge from grid",
-        "DISCHARGE_PEAK":   "🔋 Discharge (peak price)",
+        "COVER_LOAD_PEAK":  "🔋 Cover load (peak price)",
         "COVER_LOAD":       "⚖️  Cover load",
         "PV_SURPLUS":       "☀️  PV surplus / spill",
         "GRID_CONSUMPTION": "🏭 Grid consumption",
