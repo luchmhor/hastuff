@@ -783,7 +783,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 # STRATEGIC LAYER — every 30 minutes
 # ════════════════════════════════════════════════════════════════════════════
 
-@time_trigger("cron(*/30 * * * *)")
+@time_trigger("cron(0 * * * *)", "cron(30 * * * *)")
 async def strategic_optimize():
     log.info(f"── Strategic cycle ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) ──")
     try:
