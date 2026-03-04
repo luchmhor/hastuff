@@ -108,7 +108,7 @@ E_STATUS_REASON      = "input_text.energy_optimizer_reason"
 OUTLOOK_FILE         = "/config/www/energy_outlook.md"
 FORECAST_CSV_FILE    = "/config/www/energy_forecast.csv"
 
-LOG_DEBUG            = False
+LOG_DEBUG            = True
 
 TZ                   = pytz.timezone("Europe/Vienna")
 
@@ -796,6 +796,13 @@ async def strategic_optimize():
         consumption      = await _fetch_historical_consumption()
         solar            = _get_solar_forecast()
         prices           = _get_spot_prices()
+
+        if LOG_DEBUG and prices:
+            log.info("── EPEX prices (incl. network fee) ──")
+            for (h, q), p in sorted(prices.items()):
+                t_str = f"{h:02d}:{q * 15:02d}"
+                log.info(f"  {t_str}  {p * 100:.3f} ct/kWh")
+            log.info("──────────────────────
 
         if not prices:
             log.warning("No EPEX price data — mode unchanged")
