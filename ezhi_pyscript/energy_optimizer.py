@@ -73,6 +73,8 @@ BATTERY_EMPTY_PCT    =  15
 GRID_DEADZONE_W      =  10
 BATTERY_TRICKLE_W    =  10
 
+NETWORK_FEE_CT_PER_KWH = 10.5
+
 DISCHARGE_PENALTY    = 0.0001
 
 ALLOW_EXPORT         = False
@@ -104,6 +106,7 @@ E_STATUS_MODE        = "input_text.energy_optimizer_mode"
 E_STATUS_REASON      = "input_text.energy_optimizer_reason"
 
 OUTLOOK_FILE         = "/config/www/energy_outlook.md"
+FORECAST_CSV_FILE    = "/config/www/energy_forecast.csv"
 
 LOG_DEBUG            = False
 
@@ -292,7 +295,8 @@ def _get_spot_prices() -> dict:
         log.info(f"EPEX data slots found: {len(data)}")
         for entry in data:
             t = datetime.fromisoformat(entry["start_time"]).astimezone(TZ)
-            prices[(t.hour, t.minute // 15)] = float(entry["price_per_kwh"])
+            epex = float(entry["price_per_kwh"])
+            prices[(t.hour, t.minute // 15)] = epex + NETWORK_FEE_CT_PER_KWH / 100.0
     except Exception as exc:
         log.error(f"Spot price error: {exc}")
     return prices
@@ -556,6 +560,7 @@ def _update_status(mode: str, reason: str):
 # 24H OUTLOOK
 # ════════════════════════════════════════════════════════════════════════════
 
+python
 async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     if not schedule or not optimal_schedule:
         log.info("Outlook: no schedule available")
@@ -574,6 +579,8 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         sp = optimal_schedule[i]
         p  = s["price"]
         n  = s["net"]
+
+        soc_start = e / BATTERY_SIZE_WH * 100.0
 
         if sp > 0:
             available_wh = max(0.0, e - E_min)
@@ -598,17 +605,18 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         # grid_w: total grid draw — positive = import, includes battery charging power
         grid_w = s["cons"] - s["solar"] - sp
         if not ALLOW_EXPORT:
-            grid_w = max(grid_w, 0.0)
+            grid_w = max(0.0, grid_w)
 
         slots.append({
-            "time":    s["time"],
-            "label":   label,
-            "price":   p,
-            "cons_w":  s["cons"],
-            "pv_w":    s["solar"],
-            "batt_w":  sp,
-            "grid_w":  grid_w,
-            "soc_pct": soc_after,
+            "time":          s["time"],
+            "label":         label,
+            "price":         p,
+            "cons_w":        s["cons"],
+            "pv_w":          s["solar"],
+            "batt_w":        sp,
+            "grid_w":        grid_w,
+            "soc_start_pct": round(soc_start, 1),
+            "soc_pct":       soc_after,
         })
         e = e_after
 
@@ -617,15 +625,15 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
     def _new_window(slot):
         return {
-            "label":   slot["label"],
-            "start":   slot["time"],
-            "prices":  [slot["price"]],
-            "cons_w":  [slot["cons_w"]],
-            "pv_w":    [slot["pv_w"]],
-            "batt_w":  [slot["batt_w"]],
-            "grid_w":  [slot["grid_w"]],
-            "soc_pct": [slot["soc_pct"]],
-            "n_slots": 1,
+            "label":         slot["label"],
+            "start":         slot["time"],
+            "prices":        [slot["price"]],
+            "cons_w":        [slot["cons_w"]],
+            "pv_w":          [slot["pv_w"]],
+            "batt_w":        [slot["batt_w"]],
+            "grid_w":        [slot["grid_w"]],
+            "soc_pct":       [slot["soc_pct"]],
+            "n_slots":       1,
         }
 
     windows = []
@@ -733,6 +741,41 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         log.info(f"Outlook written to {OUTLOOK_FILE}")
     except Exception as exc:
         log.warning(f"Could not write outlook file: {exc}")
+
+    # ── Write forecast CSV ────────────────────
+    try:
+        import io
+        import os
+        cycle_time_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        csv_header = (
+            "cycle_time,slot_time,minutes_ahead,consumption_w,pv_w,"
+            "price_ct,setpoint_w,grid_import_w,soc_start_pct,soc_end_pct,strategy\n"
+        )
+        csv_rows = []
+        for i, slot in enumerate(slots):
+            csv_rows.append(
+                f"{cycle_time_str},"
+                f"{slot['time'].strftime('%Y-%m-%d %H:%M')},"
+                f"{i * 15},"
+                f"{slot['cons_w']:.1f},"
+                f"{slot['pv_w']:.1f},"
+                f"{slot['price'] * 100:.3f},"
+                f"{slot['batt_w']},"
+                f"{slot['grid_w']:.1f},"
+                f"{slot['soc_start_pct']:.1f},"
+                f"{slot['soc_pct']:.1f},"
+                f"{slot['label']}"
+            )
+        file_exists = os.path.exists(FORECAST_CSV_FILE)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(FORECAST_CSV_FILE, flags, 0o644)
+        with io.FileIO(fd, "w") as raw:
+            if not file_exists:
+                raw.write(csv_header.encode("utf-8"))
+            raw.write(("\n".join(csv_rows) + "\n").encode("utf-8"))
+        log.info(f"Forecast CSV updated → {FORECAST_CSV_FILE}")
+    except Exception as exc:
+        log.warning(f"Could not write forecast CSV: {exc}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
