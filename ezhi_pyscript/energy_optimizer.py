@@ -802,7 +802,8 @@ async def strategic_optimize():
             for (h, q), p in sorted(prices.items()):
                 t_str = f"{h:02d}:{q * 15:02d}"
                 log.info(f"  {t_str}  {p * 100:.3f} ct/kWh")
-            log.info("──────────────────────
+            log.info("─────────────────────────────────────")
+
 
         if not prices:
             log.warning("No EPEX price data — mode unchanged")
