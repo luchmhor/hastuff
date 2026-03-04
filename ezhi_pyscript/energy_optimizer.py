@@ -560,7 +560,6 @@ def _update_status(mode: str, reason: str):
 # 24H OUTLOOK
 # ════════════════════════════════════════════════════════════════════════════
 
-python
 async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     if not schedule or not optimal_schedule:
         log.info("Outlook: no schedule available")
