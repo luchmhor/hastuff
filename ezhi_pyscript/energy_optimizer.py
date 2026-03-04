@@ -601,7 +601,6 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         else:
             label = "GRID_CONSUMPTION"
 
-        # grid_w: total grid draw — positive = import, includes battery charging power
         grid_w = s["cons"] - s["solar"] - sp
         if not ALLOW_EXPORT:
             grid_w = max(0.0, grid_w)
@@ -624,15 +623,15 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
     def _new_window(slot):
         return {
-            "label":         slot["label"],
-            "start":         slot["time"],
-            "prices":        [slot["price"]],
-            "cons_w":        [slot["cons_w"]],
-            "pv_w":          [slot["pv_w"]],
-            "batt_w":        [slot["batt_w"]],
-            "grid_w":        [slot["grid_w"]],
-            "soc_pct":       [slot["soc_pct"]],
-            "n_slots":       1,
+            "label":   slot["label"],
+            "start":   slot["time"],
+            "prices":  [slot["price"]],
+            "cons_w":  [slot["cons_w"]],
+            "pv_w":    [slot["pv_w"]],
+            "batt_w":  [slot["batt_w"]],
+            "grid_w":  [slot["grid_w"]],
+            "soc_pct": [slot["soc_pct"]],
+            "n_slots": 1,
         }
 
     windows = []
@@ -688,22 +687,22 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     md_lines.append("|------|----------|-------|-------------|-------------|-------------|---------------|---------|")
 
     for w in windows:
-        start_str   = w["start"].strftime("%H:%M")
-        end_str     = w["end"].strftime("%H:%M")
-        duration    = w["n_slots"] * 15
-        desc        = label_text.get(w["label"], w["label"])
-        avg_price   = _avg(w["prices"])
-        min_price   = min(w["prices"])
-        max_price   = max(w["prices"])
-        avg_cons    = _avg(w["cons_w"])
-        avg_pv      = _avg(w["pv_w"])
-        avg_grid    = _avg(w["grid_w"])
-        avg_batt    = _avg(w["batt_w"])
-        soc_end     = w["soc_pct"][-1]
-        avg_ct      = avg_price * 100
-        min_ct      = min_price * 100
-        max_ct      = max_price * 100
-        price_str   = f"{avg_ct:.1f} ct" if abs(min_ct - max_ct) < 0.05 else f"{avg_ct:.1f} ct ({min_ct:.1f}–{max_ct:.1f})"
+        start_str = w["start"].strftime("%H:%M")
+        end_str   = w["end"].strftime("%H:%M")
+        duration  = w["n_slots"] * 15
+        desc      = label_text.get(w["label"], w["label"])
+        avg_price = _avg(w["prices"])
+        min_price = min(w["prices"])
+        max_price = max(w["prices"])
+        avg_cons  = _avg(w["cons_w"])
+        avg_pv    = _avg(w["pv_w"])
+        avg_grid  = _avg(w["grid_w"])
+        avg_batt  = _avg(w["batt_w"])
+        soc_end   = w["soc_pct"][-1]
+        avg_ct    = avg_price * 100
+        min_ct    = min_price * 100
+        max_ct    = max_price * 100
+        price_str = f"{avg_ct:.1f} ct" if abs(min_ct - max_ct) < 0.05 else f"{avg_ct:.1f} ct ({min_ct:.1f}–{max_ct:.1f})"
 
         log_lines.append(
             f"  {start_str}–{end_str} ({duration:3d}min)  "
@@ -741,41 +740,44 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     except Exception as exc:
         log.warning(f"Could not write outlook file: {exc}")
 
-    # ── Write forecast CSV ────────────────────
+    # ── Write forecast to InfluxDB ────────────────────
     try:
-        import io
-        import os
-        cycle_time_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-        csv_header = (
-            "cycle_time,slot_time,minutes_ahead,consumption_w,pv_w,"
-            "price_ct,setpoint_w,grid_import_w,soc_start_pct,soc_end_pct,strategy\n"
-        )
-        csv_rows = []
+        lines = []
         for i, slot in enumerate(slots):
-            csv_rows.append(
-                f"{cycle_time_str},"
-                f"{slot['time'].strftime('%Y-%m-%d %H:%M')},"
-                f"{i * 15},"
-                f"{slot['cons_w']:.1f},"
-                f"{slot['pv_w']:.1f},"
-                f"{slot['price'] * 100:.3f},"
-                f"{slot['batt_w']},"
-                f"{slot['grid_w']:.1f},"
-                f"{slot['soc_start_pct']:.1f},"
-                f"{slot['soc_pct']:.1f},"
-                f"{slot['label']}"
+            ts_ns  = int(slot["time"].timestamp()) * 1000000000
+            tags   = (
+                f"minutes_ahead={i * 15},"
+                f"strategy={slot['label']}"
             )
-        file_exists = os.path.exists(FORECAST_CSV_FILE)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        fd = os.open(FORECAST_CSV_FILE, flags, 0o644)
-        with io.FileIO(fd, "w") as raw:
-            if not file_exists:
-                raw.write(csv_header.encode("utf-8"))
-            raw.write(("\n".join(csv_rows) + "\n").encode("utf-8"))
-        log.info(f"Forecast CSV updated → {FORECAST_CSV_FILE}")
-    except Exception as exc:
-        log.warning(f"Could not write forecast CSV: {exc}")
+            fields = (
+                f"consumption_w={slot['cons_w']:.1f},"
+                f"pv_w={slot['pv_w']:.1f},"
+                f"price_ct={slot['price'] * 100:.3f},"
+                f"setpoint_w={slot['batt_w']}i,"
+                f"grid_import_w={slot['grid_w']:.1f},"
+                f"soc_start_pct={slot['soc_start_pct']:.1f},"
+                f"soc_end_pct={slot['soc_pct']:.1f}"
+            )
+            lines.append(f"energy_optimizer_forecast,{tags} {fields} {ts_ns}")
 
+        body   = "\n".join(lines).encode("utf-8")
+        params = f"db={INFLUX_DB}&u={INFLUX_USER}&p={INFLUX_PASS}"
+        url    = f"http://localhost:8086/write?{params}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                data=body,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status in (200, 204):
+                    log.info(f"Forecast written to InfluxDB ({len(lines)} points)")
+                else:
+                    text = await resp.text()
+                    log.warning(f"InfluxDB write failed: {resp.status} {text}")
+    except Exception as exc:
+        log.warning(f"Could not write forecast to InfluxDB: {exc}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — every 30 minutes
