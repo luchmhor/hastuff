@@ -291,8 +291,14 @@ def _get_solar_forecast() -> dict:
 def _get_spot_prices() -> dict:
     prices = {}
     try:
-        data = (state.getattr(E_PRICE_DATA) or {}).get("data", [])
+        raw_state = state.get(E_PRICE_DATA)
+        raw_attrs = state.getattr(E_PRICE_DATA) or {}
+        log.info(f"EPEX sensor state: {raw_state}")
+        log.info(f"EPEX sensor attrs keys: {list(raw_attrs.keys())}")
+        data = raw_attrs.get("data", [])
         log.info(f"EPEX data slots found: {len(data)}")
+        if data:
+            log.info(f"EPEX first entry: {data[0]}")
         for entry in data:
             t = datetime.fromisoformat(entry["start_time"]).astimezone(TZ)
             epex = float(entry["price_per_kwh"])
