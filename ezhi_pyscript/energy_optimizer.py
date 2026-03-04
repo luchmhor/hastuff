@@ -288,6 +288,47 @@ def _get_solar_forecast() -> dict:
 # SPOT PRICES + SCHEDULE
 # ════════════════════════════════════════════════════════════════════════════
 
+def _fallback_prices() -> dict:
+    """
+    Synthetic 24h price curve used when EPEX data is unavailable.
+    Shape: cheap night/midday, expensive morning and evening peaks.
+    All values in EUR/kWh including network fee.
+    """
+    # Base hourly prices in ct/kWh (EPEX component only)
+    hourly_ct = {
+        0:  8.0,
+        1:  7.5,
+        2:  7.0,
+        3:  6.5,
+        4:  6.5,
+        5:  7.0,
+        6: 18.0,   # morning peak start
+        7: 22.0,
+        8: 20.0,   # morning peak end
+        9: 15.0,
+        10: 11.0,
+        11:  8.0,
+        12:  6.0,  # midday cheap
+        13:  6.0,
+        14:  7.0,
+        15:  9.0,
+        16: 14.0,
+        17: 22.0,  # evening peak start
+        18: 26.0,
+        19: 28.0,
+        20: 24.0,  # evening peak end
+        21: 18.0,
+        22: 13.0,
+        23: 10.0,
+    }
+    prices = {}
+    for h, ct in hourly_ct.items():
+        p = (ct + NETWORK_FEE_CT_PER_KWH) / 100.0
+        for q in range(4):
+            prices[(h, q)] = p
+    return prices
+
+
 def _get_spot_prices() -> dict:
     prices = {}
     try:
@@ -300,11 +341,16 @@ def _get_spot_prices() -> dict:
         if data:
             log.info(f"EPEX first entry: {data[0]}")
         for entry in data:
-            t = datetime.fromisoformat(entry["start_time"]).astimezone(TZ)
+            t    = datetime.fromisoformat(entry["start_time"]).astimezone(TZ)
             epex = float(entry["price_per_kwh"])
             prices[(t.hour, t.minute // 15)] = epex + NETWORK_FEE_CT_PER_KWH / 100.0
     except Exception as exc:
         log.error(f"Spot price error: {exc}")
+
+    if not prices:
+        log.warning("EPEX data unavailable — using fallback price curve")
+        return _fallback_prices()
+
     return prices
 
 
