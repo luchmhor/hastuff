@@ -355,7 +355,10 @@ def _get_spot_prices() -> dict:
 
 
 def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
-    now = datetime.now(TZ)
+    now     = datetime.now(TZ)
+    # Snap to current 15-min slot boundary regardless of when triggered
+    minute  = (now.minute // 15) * 15
+    now     = now.replace(minute=minute, second=0, microsecond=0)
     out = []
     for i in range(96):
         t   = now + timedelta(minutes=15 * i)
@@ -372,6 +375,7 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
             "net":   c - s,
         })
     return out
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
