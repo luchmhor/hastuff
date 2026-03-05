@@ -74,6 +74,7 @@ GRID_DEADZONE_W      =  10
 BATTERY_TRICKLE_W    =  10
 
 NETWORK_FEE_CT_PER_KWH = 10.5
+SCHEDULE_SLOTS = 96          # number of 15-min slots (96 = 24 h)
 
 DISCHARGE_PENALTY    = 0.001
 
@@ -355,12 +356,11 @@ def _get_spot_prices() -> dict:
 
 
 def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
-    now     = datetime.now(TZ)
-    # Snap to current 15-min slot boundary regardless of when triggered
-    minute  = (now.minute // 15) * 15
-    now     = now.replace(minute=minute, second=0, microsecond=0)
+    now    = datetime.now(TZ)
+    minute = (now.minute // 15) * 15
+    now    = now.replace(minute=minute, second=0, microsecond=0)
     out = []
-    for i in range(96):
+    for i in range(SCHEDULE_SLOTS):
         t   = now + timedelta(minutes=15 * i)
         key = (t.hour, t.minute // 15)
         c   = consumption.get(key, 300.0)
@@ -375,8 +375,6 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
             "net":   c - s,
         })
     return out
-
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # LP OPTIMIZER
@@ -629,7 +627,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
     slots = []
     e     = E_now
-    for i in range(min(len(schedule), len(optimal_schedule))):
+    for i in range(min(len(schedule), len(optimal_schedule), SCHEDULE_SLOTS)):
         s  = schedule[i]
         sp = optimal_schedule[i]
         p  = s["price"]
