@@ -835,6 +835,150 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
     except Exception as exc:
         log.warning(f"Could not write forecast to InfluxDB: {exc}")
 
+# ════════════════════════════════════════════════════════════════════════════
+# STRATEGIC LAYER — every 30 minutes
+# ════════════════════════════════════════════════════════════════════════════
+
+@time_trigger("cron(0 * * * *)", "cron(30 * * * *)")
+async def strategic_optimize():
+    log.info(f"── Strategic cycle ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) ──")
+    try:
+        soc_raw = state.get(E_BATTERY_SOC)
+        if soc_raw in (None, "unavailable", "unknown"):
+            log.warning("Battery SOC unavailable — skipping")
+            return
+        soc = float(soc_raw)
+
+        consumption      = await _fetch_historical_consumption()
+        solar            = _get_solar_forecast()
+        prices           = _get_spot_prices()
+
+        if LOG_DEBUG and prices:
+            log.info("── EPEX prices (incl. network fee) ──")
+            for (h, q), p in sorted(prices.items()):
+                t_str = f"{h:02d}:{q * 15:02d}"
+                log.info(f"  {t_str}  {p * 100:.3f} ct/kWh")
+            log.info("─────────────────────────────────────")
+
+        if not prices:
+            log.warning("No EPEX price data — mode unchanged")
+            return
+
+        schedule         = _build_schedule(consumption, solar, prices)
+        optimal_schedule = _get_schedule(soc, schedule)
+        _ctx["last_schedule"] = optimal_schedule
+
+        raw_sp = optimal_schedule[0] if optimal_schedule else 0
+        net    = schedule[0]["net"]   if schedule         else 0.0
+        price  = schedule[0]["price"] if schedule         else 0.15
+
+        mode, sp = _apply_trickle_override(soc, raw_sp, net, price)
+        _write_outputs(mode, sp)
+
+        p25 = _ctx.get("p25", 0.10)
+        p75 = _ctx.get("p75", 0.20)
+
+        if mode == "GRID_CHARGE":
+            reason = (
+                f"Price {price * 100:.1f} ct/kWh is in cheapest 25% "
+                f"(≤ {p25 * 100:.1f} ct). "
+                f"Charging battery at max rate ({OUTPUT_MIN_W}W). SOC: {soc:.0f}%."
+            )
+        elif mode == "DISCHARGE":
+            reason = (
+                f"Price {price * 100:.1f} ct/kWh is in most expensive 25% "
+                f"(≥ {p75 * 100:.1f} ct). "
+                f"Discharging battery ({sp:+d}W). SOC: {soc:.0f}%."
+            )
+        elif mode == "TRICKLE" and soc >= BATTERY_FULL_PCT:
+            reason = (
+                f"Battery full ({soc:.0f}%). Holding SOC in "
+                f"{BATTERY_TRICKLE_PCT}–{BATTERY_FULL_PCT}% band. "
+                f"Price: {price * 100:.1f} ct/kWh."
+            )
+        elif mode == "TRICKLE":
+            reason = (
+                f"SOC {soc:.0f}% in hysteresis band "
+                f"({BATTERY_TRICKLE_PCT}–{BATTERY_FULL_PCT}%). "
+                f"Gently recharging. Price: {price * 100:.1f} ct/kWh."
+            )
+        elif mode == "BALANCE" and soc >= BATTERY_FULL_PCT and net < -GRID_DEADZONE_W:
+            reason = (
+                f"Battery full ({soc:.0f}%) with PV surplus {abs(net):.0f}W. "
+                f"Spilling {sp:+d}W. Price: {price * 100:.1f} ct/kWh."
+            )
+        else:
+            if USE_LP_OPTIMIZER:
+                reason = (
+                    f"LP: no strong signal at {price * 100:.1f} ct/kWh "
+                    f"[P25={p25 * 100:.1f} P75={p75 * 100:.1f} ct]. "
+                    f"Grid consumption. SOC: {soc:.0f}%. Slot-0: {raw_sp:+d}W."
+                )
+            else:
+                fv       = _assess_future_value(schedule, p75)
+                pvc      = _estimate_pv_recharge(schedule, p75)
+                avail_wh = max(0.0, (soc - BATTERY_EMPTY_PCT) / 100.0 * BATTERY_SIZE_WH)
+                if fv["high_demand_wh"] > 0 and avail_wh >= fv["high_demand_wh"] and pvc < fv["high_demand_wh"]:
+                    reason = (
+                        f"Mid price ({price * 100:.1f} ct). Holding for expensive window "
+                        f"({fv['slots']} slots, {fv['high_demand_wh']:.0f}Wh). "
+                        f"PV ({pvc:.0f}Wh) insufficient. SOC: {soc:.0f}%."
+                    )
+                elif fv["high_demand_wh"] > 0:
+                    reason = (
+                        f"Mid price ({price * 100:.1f} ct). Expensive window ahead. "
+                        f"PV ({pvc:.0f}Wh) will recharge in time. SOC: {soc:.0f}%."
+                    )
+                else:
+                    reason = (
+                        f"Mid price ({price * 100:.1f} ct). No peak window ahead. "
+                        f"Grid consumption. SOC: {soc:.0f}%."
+                    )
+
+        _update_status(mode, reason)
+        log.info(
+            f"Mode={mode} | SOC={soc:.0f}% | "
+            f"Price={price * 100:.1f} ct | "
+            f"Optimizer={raw_sp:+d}W → Applied={sp:+d}W"
+        )
+
+        now = datetime.now(TZ)
+        if now.minute < 30:
+            await _log_24h_outlook(schedule, optimal_schedule, soc)
+
+    except Exception as exc:
+        import traceback
+        log.error(f"Strategic error: {exc}\n{traceback.format_exc()}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# EVENT TRIGGERS
+# ════════════════════════════════════════════════════════════════════════════
+
+@state_trigger(E_PRICE_DATA)
+async def on_price_update(**kwargs):
+    log.info("EPEX price data updated — triggering strategic cycle")
+    await strategic_optimize()
+
+@state_trigger(E_BATTERY_SOC)
+def on_soc_critical(**kwargs):
+    soc_raw = state.get(E_BATTERY_SOC)
+    if soc_raw in (None, "unavailable", "unknown"):
+        return
+    if float(soc_raw) < 12:
+        input_number.set_value(entity_id=E_MODE_ID,  value=0)
+        input_number.set_value(entity_id=E_SETPOINT, value=0)
+        _update_status(
+            "BALANCE",
+            f"⚠️ Emergency: SOC critically low ({soc_raw}%). "
+            f"Inverter forced to 0W."
+        )
+        persistent_notification.create(
+            title="⚠️ Battery Critical",
+            message=f"SOC is {soc_raw}% — inverter forced to 0 W.",
+            notification_id="energy_optimizer_critical",
+        )
+        log.warning(f"Battery critical ({soc_raw}%) — forced BALANCE, setpoint 0W")
 
 # ════════════════════════════════════════════════════════════════════════════
 # MANUAL SERVICE CALL
