@@ -838,10 +838,10 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         log.warning(f"Could not write forecast to InfluxDB: {exc}")
 
 # ════════════════════════════════════════════════════════════════════════════
-# STRATEGIC LAYER — every 30 minutes
+# STRATEGIC LAYER — every 15 minutes
 # ════════════════════════════════════════════════════════════════════════════
 
-@time_trigger("cron(0 * * * *)", "cron(30 * * * *)")
+@time_trigger("cron(0,15,30,45 * * * *)")
 async def strategic_optimize():
     log.info(f"── Strategic cycle ({'LP' if USE_LP_OPTIMIZER else 'Heuristic'}) ──")
     try:
@@ -944,13 +944,11 @@ async def strategic_optimize():
             f"Optimizer={raw_sp:+d}W → Applied={sp:+d}W"
         )
 
-        now = datetime.now(TZ)
-        if now.minute < 30:
-            await _log_24h_outlook(schedule, optimal_schedule, soc)
+        await _log_24h_outlook(schedule, optimal_schedule, soc)
 
     except Exception as exc:
         import traceback
-        log.error(f"Strategic error: {exc}\n{traceback.format_exc()}")
+        log.error(f"Strategic error: {exc}\\n{traceback.format_exc()}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -981,6 +979,7 @@ def on_soc_critical(**kwargs):
             notification_id="energy_optimizer_critical",
         )
         log.warning(f"Battery critical ({soc_raw}%) — forced BALANCE, setpoint 0W")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # MANUAL SERVICE CALL
