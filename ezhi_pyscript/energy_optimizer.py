@@ -405,9 +405,15 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         c_obj.append(prices[t] * DT / 1000.0)
 
     # Bounds: b in [OUTPUT_MIN_W, OUTPUT_MAX_W], g >= 0
+    # During PV-active slots, cap discharge to actual load (cons)
+    # so the battery is not drained into surplus that cannot be exported.
     bounds = []
     for t in range(N):
-        bounds.append((float(OUTPUT_MIN_W), float(OUTPUT_MAX_W)))
+        if solars[t] > GRID_DEADZONE_W:
+            max_disch = max(0.0, loads[t])   # at most cover the apartment load
+        else:
+            max_disch = float(OUTPUT_MAX_W)  # no PV — full discharge allowed
+        bounds.append((float(OUTPUT_MIN_W), max_disch))
     for t in range(N):
         bounds.append((0.0, None))
 
