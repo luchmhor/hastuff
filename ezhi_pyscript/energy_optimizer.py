@@ -692,13 +692,20 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
         soc_start = e / BATTERY_SIZE_WH * 100.0
 
-        if sp > 0:
-            available_wh = max(0.0, e - E_min)
-            e_after      = e - min(sp * DT, available_wh)
-        else:
-            e_after = e - sp * DT
+        # Free PV surplus this slot (capped at inverter charge limit)
+        pv_surplus_slot = min(
+            max(0.0, s["solar"] - s["cons"]),
+            abs(OUTPUT_MIN_W)
+        )
 
-        e_after   = max(E_min, min(E_max, e_after))
+        # Track SOC using same efficiency model as LP
+        if sp > 0:
+            e_after = e - sp * DT / BATTERY_DISCHARGE_EFF
+        else:
+            e_after = e - sp * DT * BATTERY_CHARGE_EFF   # sp < 0 → e increases
+
+        e_after += pv_surplus_slot * DT * BATTERY_CHARGE_EFF  # free PV credit
+        e_after  = max(E_min, min(E_max, e_after))
         soc_after = e_after / BATTERY_SIZE_WH * 100.0
 
         if sp <= -GRID_DEADZONE_W:
@@ -817,7 +824,11 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         avg_ct    = avg_price * 100
         min_ct    = min_price * 100
         max_ct    = max_price * 100
-        price_str = f"{avg_ct:.1f} ct" if abs(min_ct - max_ct) < 0.05 else f"{avg_ct:.1f} ct ({min_ct:.1f}–{max_ct:.1f})"
+        price_str = (
+            f"{avg_ct:.1f} ct"
+            if abs(min_ct - max_ct) < 0.05
+            else f"{avg_ct:.1f} ct ({min_ct:.1f}–{max_ct:.1f})"
+        )
 
         log_lines.append(
             f"  {start_str}–{end_str} ({duration:3d}min)  "
@@ -893,6 +904,7 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
                     log.warning(f"InfluxDB write failed: {resp.status} {text}")
     except Exception as exc:
         log.warning(f"Could not write forecast to InfluxDB: {exc}")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # STRATEGIC LAYER — every 15 minutes
