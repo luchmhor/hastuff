@@ -431,11 +431,10 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         A_ub.append(row)
         b_ub.append(solars[t] - loads[t])
 
-    # 2) SOC lower bound — discharge draws more from battery than setpoint
-    #    (coefficient DT / DISCHARGE_EFF > DT → constraint is tighter)
-    # 3) SOC upper bound — charging fills battery slower than setpoint
-    #    (coefficient DT * CHARGE_EFF < DT → constraint is looser, battery
-    #     can accept more input Wh before hitting E_max)
+    # 2) SOC lower bound — discharge draws more from battery than setpoint suggests
+    #    (DT / DISCHARGE_EFF > DT → constraint is tighter, battery depletes faster)
+    # 3) SOC upper bound — charging fills battery slower than setpoint suggests
+    #    (DT * CHARGE_EFF < DT → battery accepts more input before hitting E_max)
     for k in range(N):
         row = [0.0] * (2 * N)
         for t in range(k + 1):
@@ -449,21 +448,25 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         A_ub.append(row)
         b_ub.append(E_max - E_now)
 
-    # 4) No-export for ALL slots (was previously only when net >= 0 — that was the bug).
+    # 4) No-export for ALL slots.
     #
-    #    When solar > load (net < 0): b[t] <= net forces the LP to charge the
-    #    battery at least at the PV surplus rate.  The SOC constraints above then
-    #    correctly accumulate that free energy, so the LP will no longer
-    #    pre-charge from grid to cover demand it expects PV to cover anyway.
+    #    Previously only applied when net >= 0 (load >= solar) — that was the bug.
+    #    Now applied universally:
+    #      net >= 0: caps discharge to net load, no grid push (unchanged behaviour)
+    #      net <  0: forces b[t] <= net → battery must absorb PV surplus, so the
+    #                SOC constraints correctly accumulate free PV energy and the LP
+    #                no longer pre-charges from grid for demand PV will cover.
     #
-    #    When solar <= load (net >= 0): behaviour is unchanged — discharge is
-    #    capped to net load so no energy is pushed to the grid.
+    #    RHS is clamped to OUTPUT_MIN_W to prevent infeasibility when PV surplus
+    #    exceeds the inverter's maximum charge rate (e.g. solar − load > 1200 W).
+    #    In that case the inverter absorbs as much as it physically can and the
+    #    remainder is curtailed by the hardware.
     for t in range(N):
         net    = loads[t] - solars[t]
         row    = [0.0] * (2 * N)
         row[t] = 1.0
         A_ub.append(row)
-        b_ub.append(net)
+        b_ub.append(max(net, float(OUTPUT_MIN_W)))
 
     try:
         result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
@@ -507,7 +510,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # HEURISTIC OPTIMIZER
 # ════════════════════════════════════════════════════════════════════════════
@@ -536,7 +538,7 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
     if not schedule:
         return [0] * 96
 
-    prices_sorted = sorted(s["price"] for s in schedule)
+    prices_sorted = sorted([s["price"] for s in schedule])  # list comp, not generator
     n   = len(prices_sorted)
     p25 = prices_sorted[max(0, int(n * 0.25) - 1)]
     p75 = prices_sorted[min(n - 1, int(n * 0.75))]
