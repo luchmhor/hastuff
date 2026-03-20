@@ -393,12 +393,20 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     solars = [s["solar"] for s in schedule]
     prices = [s["price"] for s in schedule]
 
-    # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = charge)
+    # Pre-compute per-slot PV surplus: energy that flows into the battery for free
+    # when solar > load (ALLOW_EXPORT=False means surplus must go into battery).
+    # Capped at abs(OUTPUT_MIN_W) — inverter cannot absorb more than its max charge rate.
+    surplus = [
+        min(max(0.0, solars[t] - loads[t]), abs(OUTPUT_MIN_W))
+        for t in range(N)
+    ]
+
+    # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = additional grid charge)
     #            g[0..N-1] = grid import slack (always >= 0)
     #
     # Objective: minimise total grid cost.
-    #   Discharge reward is discounted by BATTERY_DISCHARGE_EFF so the LP only
-    #   discharges when the price spread is large enough to cover round-trip losses.
+    #   Discharge reward discounted by BATTERY_DISCHARGE_EFF so the LP only
+    #   discharges when the price spread covers round-trip losses.
     c_obj = []
     for t in range(N):
         c_obj.append(
@@ -409,7 +417,8 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         c_obj.append(prices[t] * DT / 1000.0)
 
     # Bounds: b in [OUTPUT_MIN_W, OUTPUT_MAX_W], g >= 0
-    # During PV-active slots, cap discharge to actual load.
+    # During PV-active slots, cap discharge to actual load so no energy
+    # is pushed onto the grid from the battery side.
     bounds = []
     for t in range(N):
         if solars[t] > GRID_DEADZONE_W:
@@ -431,42 +440,51 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         A_ub.append(row)
         b_ub.append(solars[t] - loads[t])
 
-    # 2) SOC lower bound — discharge draws more from battery than setpoint suggests
-    #    (DT / DISCHARGE_EFF > DT → constraint is tighter, battery depletes faster)
-    # 3) SOC upper bound — charging fills battery slower than setpoint suggests
-    #    (DT * CHARGE_EFF < DT → battery accepts more input before hitting E_max)
+    # 2) SOC lower bound + 3) SOC upper bound — with PV surplus credited into the RHS.
+    #
+    #   PV surplus charges the battery for free each slot. Rather than adding a
+    #   hard constraint that forces b[t] <= net in surplus slots (which caused
+    #   infeasibility when battery was near full), we fold the free energy into
+    #   the RHS of the existing SOC bounds.  The LP then naturally avoids
+    #   unnecessary grid pre-charging because it already "sees" the battery
+    #   being filled by PV at no cost.
+    #
+    #   cum_surplus_e is capped at (E_max - E_now) — the battery's current free
+    #   capacity — to guarantee the upper-bound RHS stays >= 0 at all times.
+    #   Excess surplus beyond this cap is curtailed by the inverter hardware.
+    cum_surplus_e = 0.0
     for k in range(N):
+        cum_surplus_e = min(
+            cum_surplus_e + surplus[k] * DT * BATTERY_CHARGE_EFF,
+            E_max - E_now,
+        )
+
+        # Lower bound: sum(b[0..k]) * DT/EFF <= available_energy + free_pv_energy
         row = [0.0] * (2 * N)
         for t in range(k + 1):
             row[t] = DT / BATTERY_DISCHARGE_EFF
         A_ub.append(row)
-        b_ub.append(E_now - E_min)
+        b_ub.append(E_now - E_min + cum_surplus_e)
 
+        # Upper bound: battery cannot be charged beyond E_max.
+        # Free PV energy already consumes some of the headroom.
         row = [0.0] * (2 * N)
         for t in range(k + 1):
             row[t] = -DT * BATTERY_CHARGE_EFF
         A_ub.append(row)
-        b_ub.append(E_max - E_now)
+        b_ub.append(max(0.0, E_max - E_now - cum_surplus_e))
 
-    # 4) No-export for ALL slots.
-    #
-    #    Previously only applied when net >= 0 (load >= solar) — that was the bug.
-    #    Now applied universally:
-    #      net >= 0: caps discharge to net load, no grid push (unchanged behaviour)
-    #      net <  0: forces b[t] <= net → battery must absorb PV surplus, so the
-    #                SOC constraints correctly accumulate free PV energy and the LP
-    #                no longer pre-charges from grid for demand PV will cover.
-    #
-    #    RHS is clamped to OUTPUT_MIN_W to prevent infeasibility when PV surplus
-    #    exceeds the inverter's maximum charge rate (e.g. solar − load > 1200 W).
-    #    In that case the inverter absorbs as much as it physically can and the
-    #    remainder is curtailed by the hardware.
-    for t in range(N):
-        net    = loads[t] - solars[t]
-        row    = [0.0] * (2 * N)
-        row[t] = 1.0
-        A_ub.append(row)
-        b_ub.append(max(net, float(OUTPUT_MIN_W)))
+    # 4) No-export: original form — only applied when load >= solar.
+    #    PV surplus slots are handled via the SOC constraints above, not here.
+    #    Removing the hard b[t] <= net for surplus slots was the infeasibility fix.
+    if not ALLOW_EXPORT:
+        for t in range(N):
+            net = loads[t] - solars[t]
+            if net >= 0:
+                row    = [0.0] * (2 * N)
+                row[t] = 1.0
+                A_ub.append(row)
+                b_ub.append(net)
 
     try:
         result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
@@ -480,11 +498,11 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             sp = int(round(result.x[t] / 10) * 10)
             sp = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, sp))
             optimal.append(sp)
-            # Track SOC with efficiency (mirrors constraint coefficients above)
             if sp > 0:
                 e -= sp * DT / BATTERY_DISCHARGE_EFF
             else:
                 e -= sp * DT * BATTERY_CHARGE_EFF   # sp < 0 → e increases
+            e += surplus[t] * DT * BATTERY_CHARGE_EFF  # free PV charging
             e = max(E_min, min(E_max, e))
 
         total_cost = 0.0
@@ -497,6 +515,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
                 e -= optimal[t] * DT / BATTERY_DISCHARGE_EFF
             else:
                 e -= optimal[t] * DT * BATTERY_CHARGE_EFF
+            e += surplus[t] * DT * BATTERY_CHARGE_EFF
             e = max(E_min, min(E_max, e))
 
         log.info(
@@ -509,6 +528,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     except Exception as exc:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # HEURISTIC OPTIMIZER
