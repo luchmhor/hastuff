@@ -77,6 +77,8 @@ NETWORK_FEE_CT_PER_KWH = 10.5
 SCHEDULE_SLOTS = 96          # number of 15-min slots (96 = 24 h)
 
 DISCHARGE_PENALTY    = 0.001
+BATTERY_CHARGE_EFF    = 0.95
+BATTERY_DISCHARGE_EFF = 0.95
 
 ALLOW_EXPORT         = False
 
@@ -391,41 +393,37 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     solars = [s["solar"] for s in schedule]
     prices = [s["price"] for s in schedule]
 
-    # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = grid charge)
+    # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = charge)
     #            g[0..N-1] = grid import slack (always >= 0)
     #
-    # Objective: minimise total grid cost
-    #   b[t] > 0 (discharge): saves grid import → reward  = -prices[t]
-    #   b[t] < 0 (charge):    costs grid import → penalty = +prices[t]
-    #   g[t]:                 direct grid import cost
+    # Objective: minimise total grid cost.
+    #   Discharge reward is discounted by BATTERY_DISCHARGE_EFF so the LP only
+    #   discharges when the price spread is large enough to cover round-trip losses.
     c_obj = []
     for t in range(N):
-        c_obj.append(-prices[t] * DT / 1000.0 + DISCHARGE_PENALTY * DT / 1000.0)
+        c_obj.append(
+            -prices[t] * BATTERY_DISCHARGE_EFF * DT / 1000.0
+            + DISCHARGE_PENALTY * DT / 1000.0
+        )
     for t in range(N):
         c_obj.append(prices[t] * DT / 1000.0)
 
     # Bounds: b in [OUTPUT_MIN_W, OUTPUT_MAX_W], g >= 0
-    # During PV-active slots, cap discharge to actual load (cons)
-    # so the battery is not drained into surplus that cannot be exported.
+    # During PV-active slots, cap discharge to actual load.
     bounds = []
     for t in range(N):
         if solars[t] > GRID_DEADZONE_W:
-            max_disch = max(0.0, loads[t])   # at most cover the apartment load
+            max_disch = max(0.0, loads[t])
         else:
-            max_disch = float(OUTPUT_MAX_W)  # no PV — full discharge allowed
+            max_disch = float(OUTPUT_MAX_W)
         bounds.append((float(OUTPUT_MIN_W), max_disch))
     for t in range(N):
         bounds.append((0.0, None))
 
-    # Constraints:
-    # 1) Grid import slack: g[t] >= load[t] - solar[t] - b[t]
-    #    → -b[t] - g[t] <= solar[t] - load[t]
-    # 2) SOC lower bound:  sum(b[0..k]) * DT <= E_now - E_min
-    # 3) SOC upper bound: -sum(b[0..k]) * DT <= E_max - E_now
-    # 4) No export: b[t] <= load[t] - solar[t]  when net >= 0
     A_ub = []
     b_ub = []
 
+    # 1) Grid import slack: g[t] >= load[t] - solar[t] - b[t]
     for t in range(N):
         row        = [0.0] * (2 * N)
         row[t]     = -1.0
@@ -433,27 +431,39 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         A_ub.append(row)
         b_ub.append(solars[t] - loads[t])
 
+    # 2) SOC lower bound — discharge draws more from battery than setpoint
+    #    (coefficient DT / DISCHARGE_EFF > DT → constraint is tighter)
+    # 3) SOC upper bound — charging fills battery slower than setpoint
+    #    (coefficient DT * CHARGE_EFF < DT → constraint is looser, battery
+    #     can accept more input Wh before hitting E_max)
     for k in range(N):
         row = [0.0] * (2 * N)
         for t in range(k + 1):
-            row[t] = DT
+            row[t] = DT / BATTERY_DISCHARGE_EFF
         A_ub.append(row)
         b_ub.append(E_now - E_min)
 
         row = [0.0] * (2 * N)
         for t in range(k + 1):
-            row[t] = -DT
+            row[t] = -DT * BATTERY_CHARGE_EFF
         A_ub.append(row)
         b_ub.append(E_max - E_now)
 
-    if not ALLOW_EXPORT:
-        for t in range(N):
-            net = loads[t] - solars[t]
-            if net >= 0:
-                row    = [0.0] * (2 * N)
-                row[t] = 1.0
-                A_ub.append(row)
-                b_ub.append(net)
+    # 4) No-export for ALL slots (was previously only when net >= 0 — that was the bug).
+    #
+    #    When solar > load (net < 0): b[t] <= net forces the LP to charge the
+    #    battery at least at the PV surplus rate.  The SOC constraints above then
+    #    correctly accumulate that free energy, so the LP will no longer
+    #    pre-charge from grid to cover demand it expects PV to cover anyway.
+    #
+    #    When solar <= load (net >= 0): behaviour is unchanged — discharge is
+    #    capped to net load so no energy is pushed to the grid.
+    for t in range(N):
+        net    = loads[t] - solars[t]
+        row    = [0.0] * (2 * N)
+        row[t] = 1.0
+        A_ub.append(row)
+        b_ub.append(net)
 
     try:
         result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
@@ -467,7 +477,12 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             sp = int(round(result.x[t] / 10) * 10)
             sp = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, sp))
             optimal.append(sp)
-            e -= sp * DT
+            # Track SOC with efficiency (mirrors constraint coefficients above)
+            if sp > 0:
+                e -= sp * DT / BATTERY_DISCHARGE_EFF
+            else:
+                e -= sp * DT * BATTERY_CHARGE_EFF   # sp < 0 → e increases
+            e = max(E_min, min(E_max, e))
 
         total_cost = 0.0
         e = E_now
@@ -475,14 +490,23 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             grid_w = loads[t] - solars[t] - optimal[t]
             if grid_w > 0:
                 total_cost += grid_w * prices[t] * DT / 1000.0
-            e -= optimal[t] * DT
+            if optimal[t] > 0:
+                e -= optimal[t] * DT / BATTERY_DISCHARGE_EFF
+            else:
+                e -= optimal[t] * DT * BATTERY_CHARGE_EFF
+            e = max(E_min, min(E_max, e))
 
-        log.info(f"LP solved ✓ | Slot-0={optimal[0]:+d}W | 24h cost={total_cost:.4f} €")
+        log.info(
+            f"LP solved ✓ | Slot-0={optimal[0]:+d}W | "
+            f"24h cost={total_cost:.4f} € | "
+            f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%}"
+        )
         return optimal
 
     except Exception as exc:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # HEURISTIC OPTIMIZER
