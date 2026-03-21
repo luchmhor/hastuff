@@ -89,7 +89,7 @@ INFLUX_DB              = "homeassistant"
 INFLUX_USER            = "homeassistant"
 INFLUX_PASS            = "hainflux!"
 INFLUX_ENTITY          = "total_consumption"
-INFLUX_ENTITY_PV       = "total_pv_production"   # entity_id for actual PV production
+INFLUX_ENTITY_PV       = "ezhi_photovoltaic_power"   # entity_id for actual PV production
 INFLUX_UNIT            = "W"
 
 SOLAR_BLEND_HOURS      = 2      # hours ahead over which actuals scale factor is blended
