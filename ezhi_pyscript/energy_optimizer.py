@@ -695,15 +695,27 @@ def _mode_from_setpoint(sp: int) -> str:
 
 def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tuple:
     p75 = _ctx.get("p75", 0.20)
+
+    # During peak prices let LP decide unconditionally
     if price >= p75:
         return (_mode_from_setpoint(sp), sp)
+
     if soc >= BATTERY_FULL_PCT:
-        if net < -GRID_DEADZONE_W:
-            return ("BALANCE", max(0, min(OUTPUT_MAX_W, int(net * -1))))
+        if sp > GRID_DEADZONE_W:
+            # LP explicitly wants to discharge (cover load at good price) — honour it
+            return (_mode_from_setpoint(sp), sp)
         else:
-            return ("TRICKLE", BATTERY_TRICKLE_W)
+            # Battery full — hold at 0, tactical layer keeps grid ≈ 0 naturally
+            # PV covers load, battery floats; no export, no grid import
+            return ("TRICKLE", 0)
+
     elif soc >= BATTERY_TRICKLE_PCT:
-        return ("TRICKLE", -BATTERY_TRICKLE_W)
+        if net < -GRID_DEADZONE_W:
+            # PV surplus is already charging battery — no nudge needed
+            return ("BALANCE", 0)
+        else:
+            return ("TRICKLE", -BATTERY_TRICKLE_W)
+
     else:
         return (_mode_from_setpoint(sp), sp)
 
