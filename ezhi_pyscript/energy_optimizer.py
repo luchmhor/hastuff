@@ -2,7 +2,7 @@
 """
 Energy Optimizer — pyscript (HACS)  —  Strategic planning layer only.
 
-Runs every 30 minutes (and on EPEX price update events).
+Runs every 15 minutes (and on EPEX price update events).
 Writes mode and setpoint to input_number helpers for the HA tactical automation.
 
 Requires in configuration.yaml:
@@ -38,7 +38,7 @@ Requires in configuration.yaml:
   command_line:
     - sensor:
         name: energy_optimizer_outlook
-        command: "python3 -c \"import json; f=open('/config/www/energy_outlook.md'); print(json.dumps({'content': f.read()}))\""
+        command: "python3 -c \\"import json; f=open('/config/www/energy_outlook.md'); print(json.dumps({'content': f.read()}))\\""
         scan_interval: 1800
         value_template: "OK"
         json_attributes:
@@ -62,42 +62,47 @@ from scipy.optimize import linprog
 # CONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════
 
-USE_LP_OPTIMIZER     = True
+USE_LP_OPTIMIZER       = True
 
-BATTERY_SIZE_WH      = 2760
-OUTPUT_MIN_W         = -1200
-OUTPUT_MAX_W         =  1200
-BATTERY_FULL_PCT     =  98
-BATTERY_TRICKLE_PCT  =  96
-BATTERY_EMPTY_PCT    =  15
-GRID_DEADZONE_W      =  10
-BATTERY_TRICKLE_W    =  10
+BATTERY_SIZE_WH        = 2760
+OUTPUT_MIN_W           = -1200
+OUTPUT_MAX_W           =  1200
+BATTERY_FULL_PCT       =  98
+BATTERY_TRICKLE_PCT    =  96
+BATTERY_EMPTY_PCT      =  15
+GRID_DEADZONE_W        =  10
+BATTERY_TRICKLE_W      =  10
+
+BATTERY_CHARGE_EFF     = 0.95   # energy stored per Wh drawn from grid/PV
+BATTERY_DISCHARGE_EFF  = 0.95   # energy delivered per Wh taken from battery
+# Round-trip = 0.95 × 0.95 = 0.9025 → ~10% total system loss
 
 NETWORK_FEE_CT_PER_KWH = 10.5
-SCHEDULE_SLOTS = 96          # number of 15-min slots (96 = 24 h)
+SCHEDULE_SLOTS         = 96     # number of 15-min slots (96 = 24 h)
 
-DISCHARGE_PENALTY    = 0.001
-BATTERY_CHARGE_EFF    = 0.95
-BATTERY_DISCHARGE_EFF = 0.95
+DISCHARGE_PENALTY      = 0.0001
 
-ALLOW_EXPORT         = False
+ALLOW_EXPORT           = False
 
-INFLUX_URL           = "http://localhost:8086/query"
-INFLUX_DB            = "homeassistant"
-INFLUX_USER          = "homeassistant"
-INFLUX_PASS          = "hainflux!"
-INFLUX_ENTITY        = "total_consumption"
-INFLUX_UNIT          = "W"
+INFLUX_URL             = "http://localhost:8086/query"
+INFLUX_DB              = "homeassistant"
+INFLUX_USER            = "homeassistant"
+INFLUX_PASS            = "hainflux!"
+INFLUX_ENTITY          = "total_consumption"
+INFLUX_ENTITY_PV       = "total_pv_production"   # entity_id for actual PV production
+INFLUX_UNIT            = "W"
 
-E_BATTERY_SOC        = "sensor.ezhi_battery_state_of_charge"
-E_BATTERY_POWER      = "sensor.ezhi_battery_power"
-E_PRICE_DATA         = "sensor.epex_spot_data_total_price"
-E_SOLAR_HOUR         = "sensor.solcast_pv_forecast_forecast_next_hour"
-E_SOLAR_TODAY        = "sensor.solcast_pv_forecast_forecast_today"
-E_SOLAR_TOMORROW     = "sensor.solcast_pv_forecast_forecast_tomorrow"
+SOLAR_BLEND_HOURS      = 2      # hours ahead over which actuals scale factor is blended
 
-E_MODE_ID            = "input_number.energy_optimizer_mode_id"
-E_SETPOINT           = "input_number.energy_optimizer_setpoint"
+E_BATTERY_SOC          = "sensor.ezhi_battery_state_of_charge"
+E_BATTERY_POWER        = "sensor.ezhi_battery_power"
+E_PRICE_DATA           = "sensor.epex_spot_data_total_price"
+E_SOLAR_HOUR           = "sensor.solcast_pv_forecast_forecast_next_hour"
+E_SOLAR_TODAY          = "sensor.solcast_pv_forecast_forecast_today"
+E_SOLAR_TOMORROW       = "sensor.solcast_pv_forecast_forecast_tomorrow"
+
+E_MODE_ID              = "input_number.energy_optimizer_mode_id"
+E_SETPOINT             = "input_number.energy_optimizer_setpoint"
 MODE_IDS = {
     "BALANCE":     0,
     "GRID_CHARGE": 1,
@@ -105,15 +110,15 @@ MODE_IDS = {
     "TRICKLE":     3,
 }
 
-E_STATUS_MODE        = "input_text.energy_optimizer_mode"
-E_STATUS_REASON      = "input_text.energy_optimizer_reason"
+E_STATUS_MODE          = "input_text.energy_optimizer_mode"
+E_STATUS_REASON        = "input_text.energy_optimizer_reason"
 
-OUTLOOK_FILE         = "/config/www/energy_outlook.md"
-FORECAST_CSV_FILE    = "/config/www/energy_forecast.csv"
+OUTLOOK_FILE           = "/config/www/energy_outlook.md"
+FORECAST_CSV_FILE      = "/config/www/energy_forecast.csv"
 
-LOG_DEBUG            = True
+LOG_DEBUG              = True
 
-TZ                   = pytz.timezone("Europe/Vienna")
+TZ                     = pytz.timezone("Europe/Vienna")
 
 _ctx = {
     "p25":           0.10,
@@ -196,11 +201,65 @@ def _fallback_consumption() -> dict:
     return result
 
 
+async def _get_solar_actuals() -> dict:
+    """
+    Fetch today's actual PV production from InfluxDB, keyed by hour.
+    Returns {hour: watts} for hours that have already passed today.
+    """
+    now       = datetime.now(TZ)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    s_utc     = day_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    e_utc     = now.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    q = (
+        f'SELECT mean("value") FROM "{INFLUX_UNIT}" '
+        f"WHERE \"entity_id\" = '{INFLUX_ENTITY_PV}' "
+        f"AND time >= '{s_utc}' AND time < '{e_utc}' "
+        f"GROUP BY time(1h) fill(previous)"
+    )
+    actuals = {}
+    try:
+        data   = await _influx_query(q)
+        series = data.get("results", [{}])[0].get("series", [])
+        if not series:
+            log.warning("No actual PV data from InfluxDB")
+            return actuals
+        cols     = series[0]["columns"]
+        t_idx    = cols.index("time")
+        mean_idx = cols.index("mean")
+        for row in series[0].get("values", []):
+            if row[mean_idx] is None:
+                continue
+            t_local = datetime.fromisoformat(
+                row[t_idx].replace("Z", "+00:00")
+            ).astimezone(TZ)
+            actuals[t_local.hour] = float(row[mean_idx])
+        log.info(f"PV actuals loaded: {len(actuals)} hours")
+        if LOG_DEBUG:
+            for h in sorted(actuals.keys()):
+                log.info(f"  pv actual {h:02d}:00 = {actuals[h]:.0f}W")
+    except Exception as exc:
+        log.warning(f"PV actuals fetch error: {exc}")
+    return actuals
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # SOLAR FORECAST
 # ════════════════════════════════════════════════════════════════════════════
 
-def _get_solar_forecast() -> dict:
+def _get_solar_forecast(actuals: dict) -> dict:
+    """
+    Build per-hour solar estimate blending actuals with Solcast forecast:
+      - Past hours:                  100% actual measured production
+      - Current hour:                50% actual + 50% scaled forecast
+      - Next SOLAR_BLEND_HOURS:      gradually shift from scaled → pure forecast
+      - Beyond blend window:         pure Solcast forecast
+
+    A scale factor is derived from the ratio of actuals to forecast for the
+    last 2 completed hours, correcting for systematic forecast bias on the day
+    (e.g. cloudier than expected → scale < 1.0 → LP is less optimistic about
+    free PV charging → more willing to use battery at current prices).
+    """
     solar = {}
     now   = datetime.now(TZ)
 
@@ -228,34 +287,74 @@ def _get_solar_forecast() -> dict:
             result[t.hour] = pv_kw * 1000
         return result
 
-    # Load today's remaining hours
+    # --- Load Solcast forecast for today and tomorrow ---
+    forecast = {}
     try:
         attrs  = state.getattr(E_SOLAR_TODAY) or {}
         fl     = attrs.get("detailedHourly") or []
         parsed = _parse_hourly(fl, filter_date=now.date())
-        count  = 0
         for h, w in parsed.items():
-            if h >= now.hour:
-                solar[h] = w
-                count += 1
-        log.info(f"Solar today: {count} remaining hours loaded")
+            forecast[h] = w
+        log.info(f"Solcast today: {len(forecast)} hours loaded")
     except Exception as exc:
         log.warning(f"Solar today error: {exc}")
 
-    # Fill tomorrow's hours
     try:
         tomorrow = (now + timedelta(days=1)).date()
         attrs    = state.getattr(E_SOLAR_TOMORROW) or {}
         fl       = attrs.get("detailedHourly") or []
         parsed   = _parse_hourly(fl, filter_date=tomorrow)
-        count    = 0
         for h, w in parsed.items():
-            if h not in solar:
-                solar[h] = w
-                count += 1
-        log.info(f"Solar tomorrow: {count} hours filled")
+            forecast[h] = w
+        log.info(f"Solcast tomorrow: {len(parsed)} hours filled")
     except Exception as exc:
         log.warning(f"Solar tomorrow error: {exc}")
+
+    # --- Compute actuals-based scale factor ---
+    # Compare last 2 completed hours of actuals vs forecast.
+    # Clamped to [0.3, 2.0] to avoid wild outliers.
+    scale = 1.0
+    comparison_hours = []
+    for h in range(max(0, now.hour - 2), now.hour):
+        if h in actuals and h in forecast and forecast[h] > 50:
+            comparison_hours.append(actuals[h] / forecast[h])
+    if comparison_hours:
+        scale = sum(comparison_hours) / len(comparison_hours)
+        scale = max(0.3, min(2.0, scale))
+        log.info(
+            f"PV scale factor: {scale:.2f} "
+            f"(from {len(comparison_hours)} comparison hours)"
+        )
+    else:
+        log.info("PV scale factor: no comparison hours available, using 1.0")
+
+    # --- Build final blended solar dict ---
+    for h in range(now.hour + 24):
+        hour_of_day = h % 24
+        hours_ahead = h - now.hour
+
+        if hours_ahead < 0:
+            # Past: use actual if available, else raw forecast
+            solar[hour_of_day] = actuals.get(hour_of_day, forecast.get(hour_of_day, 0.0))
+
+        elif hours_ahead == 0:
+            # Current hour: 50/50 blend of actual and scaled forecast
+            fc = forecast.get(hour_of_day, 0.0) * scale
+            if hour_of_day in actuals:
+                solar[hour_of_day] = 0.5 * actuals[hour_of_day] + 0.5 * fc
+            else:
+                solar[hour_of_day] = fc
+
+        elif hours_ahead <= SOLAR_BLEND_HOURS:
+            # Near future: blend shifts from scaled forecast → pure forecast
+            blend_weight        = hours_ahead / SOLAR_BLEND_HOURS
+            scaled_fc           = forecast.get(hour_of_day, 0.0) * scale
+            pure_fc             = forecast.get(hour_of_day, 0.0)
+            solar[hour_of_day]  = (1 - blend_weight) * scaled_fc + blend_weight * pure_fc
+
+        else:
+            # Far future: pure Solcast forecast
+            solar[hour_of_day] = forecast.get(hour_of_day, 0.0)
 
     if solar:
         peak_hour = None
@@ -265,13 +364,15 @@ def _get_solar_forecast() -> dict:
                 peak_val  = w
                 peak_hour = h
         log.info(
-            f"Solar forecast: {len(solar)} hours, "
+            f"Solar blended: {len(solar)} hours, "
             f"peak {peak_val:.0f}W at {peak_hour:02d}:00"
         )
         if LOG_DEBUG:
             for h in sorted(solar.keys()):
                 if solar[h] > 0:
-                    log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W")
+                    actual_str = f" | actual: {actuals[h]:.0f}W" if h in actuals else ""
+                    fc_str     = f" | forecast: {forecast.get(h, 0):.0f}W"
+                    log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W{actual_str}{fc_str}")
         return solar
 
     # Last resort scalar fallback
@@ -285,44 +386,16 @@ def _get_solar_forecast() -> dict:
     return solar
 
 
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # SPOT PRICES + SCHEDULE
 # ════════════════════════════════════════════════════════════════════════════
 
 def _fallback_prices() -> dict:
-    """
-    Synthetic 24h price curve used when EPEX data is unavailable.
-    Shape: cheap night/midday, expensive morning and evening peaks.
-    All values in EUR/kWh including network fee.
-    """
-    # Base hourly prices in ct/kWh (EPEX component only)
     hourly_ct = {
-        0:  8.0,
-        1:  7.5,
-        2:  7.0,
-        3:  6.5,
-        4:  6.5,
-        5:  7.0,
-        6: 18.0,   # morning peak start
-        7: 22.0,
-        8: 20.0,   # morning peak end
-        9: 15.0,
-        10: 11.0,
-        11:  8.0,
-        12:  6.0,  # midday cheap
-        13:  6.0,
-        14:  7.0,
-        15:  9.0,
-        16: 14.0,
-        17: 22.0,  # evening peak start
-        18: 26.0,
-        19: 28.0,
-        20: 24.0,  # evening peak end
-        21: 18.0,
-        22: 13.0,
-        23: 10.0,
+        0:  8.0,  1:  7.5,  2:  7.0,  3:  6.5,  4:  6.5,  5:  7.0,
+        6: 18.0,  7: 22.0,  8: 20.0,  9: 15.0, 10: 11.0, 11:  8.0,
+        12:  6.0, 13:  6.0, 14:  7.0, 15:  9.0, 16: 14.0, 17: 22.0,
+        18: 26.0, 19: 28.0, 20: 24.0, 21: 18.0, 22: 13.0, 23: 10.0,
     }
     prices = {}
     for h, ct in hourly_ct.items():
@@ -377,6 +450,7 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
             "net":   c - s,
         })
     return out
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # LP OPTIMIZER
@@ -441,22 +515,15 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     # 2) SOC lower bound + 3) SOC upper bound.
     #
     #   PV surplus charges the battery for free, slot by slot.
-    #   We credit this free energy into the SOC constraint RHS so the LP
-    #   naturally avoids grid pre-charging for demand PV will cover.
-    #
-    #   Key fix vs previous version:
-    #     remaining_headroom tracks how much battery capacity is still
-    #     available AFTER accounting for PV already absorbed up to slot k.
-    #     The cap is applied per-slot against the shrinking headroom, not
-    #     against a fixed (E_max - E_now) ceiling.  This prevents the LP
-    #     from seeing artificially large or small surplus credits and
-    #     correctly tells it "battery will be full by 12:15 from PV alone
-    #     → no grid charge needed before that".
+    #   remaining_headroom tracks how much battery capacity is still
+    #   available AFTER accounting for PV already absorbed up to slot k.
+    #   The cap is applied per-slot against the shrinking headroom so the
+    #   LP correctly sees "battery will be full from PV alone by midday →
+    #   no grid charge needed before that".
     remaining_headroom = E_max - E_now
     cum_surplus_e      = 0.0
 
     for k in range(N):
-        # How much PV surplus can physically be absorbed this slot
         absorbed           = min(surplus[k] * DT * BATTERY_CHARGE_EFF, remaining_headroom)
         remaining_headroom = max(0.0, remaining_headroom - absorbed)
         cum_surplus_e     += absorbed
@@ -495,7 +562,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             log.warning(f"LP status {result.status}: {result.message} — fallback")
             return _heuristic_schedule(soc, schedule)
 
-        # Reconstruct optimal setpoints and track SOC with efficiency + free PV
         optimal = []
         e       = E_now
         for t in range(N):
@@ -505,8 +571,8 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             if sp > 0:
                 e -= sp * DT / BATTERY_DISCHARGE_EFF
             else:
-                e -= sp * DT * BATTERY_CHARGE_EFF   # sp < 0 → e increases
-            e += surplus[t] * DT * BATTERY_CHARGE_EFF  # free PV charging
+                e -= sp * DT * BATTERY_CHARGE_EFF
+            e += surplus[t] * DT * BATTERY_CHARGE_EFF
             e  = max(E_min, min(E_max, e))
 
         total_cost = 0.0
@@ -532,7 +598,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     except Exception as exc:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
-
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -563,7 +628,7 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
     if not schedule:
         return [0] * 96
 
-    prices_sorted = sorted([s["price"] for s in schedule])  # list comp, not generator
+    prices_sorted = sorted([s["price"] for s in schedule])
     n   = len(prices_sorted)
     p25 = prices_sorted[max(0, int(n * 0.25) - 1)]
     p75 = prices_sorted[min(n - 1, int(n * 0.75))]
@@ -630,7 +695,6 @@ def _mode_from_setpoint(sp: int) -> str:
 
 def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tuple:
     p75 = _ctx.get("p75", 0.20)
-    # Skip trickle logic entirely during peak prices — let LP decide
     if price >= p75:
         return (_mode_from_setpoint(sp), sp)
     if soc >= BATTERY_FULL_PCT:
@@ -642,6 +706,7 @@ def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tu
         return ("TRICKLE", -BATTERY_TRICKLE_W)
     else:
         return (_mode_from_setpoint(sp), sp)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # HA OUTPUT HELPERS
@@ -702,9 +767,9 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
         if sp > 0:
             e_after = e - sp * DT / BATTERY_DISCHARGE_EFF
         else:
-            e_after = e - sp * DT * BATTERY_CHARGE_EFF   # sp < 0 → e increases
+            e_after = e - sp * DT * BATTERY_CHARGE_EFF
 
-        e_after += pv_surplus_slot * DT * BATTERY_CHARGE_EFF  # free PV credit
+        e_after += pv_surplus_slot * DT * BATTERY_CHARGE_EFF
         e_after  = max(E_min, min(E_max, e_after))
         soc_after = e_after / BATTERY_SIZE_WH * 100.0
 
@@ -921,7 +986,8 @@ async def strategic_optimize():
         soc = float(soc_raw)
 
         consumption      = await _fetch_historical_consumption()
-        solar            = _get_solar_forecast()
+        actuals          = await _get_solar_actuals()
+        solar            = _get_solar_forecast(actuals)
         prices           = _get_spot_prices()
 
         if LOG_DEBUG and prices:
@@ -1017,7 +1083,7 @@ async def strategic_optimize():
 
     except Exception as exc:
         import traceback
-        log.error(f"Strategic error: {exc}\\n{traceback.format_exc()}")
+        log.error(f"Strategic error: {exc}\n{traceback.format_exc()}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
