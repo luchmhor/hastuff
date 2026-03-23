@@ -73,9 +73,6 @@ BATTERY_EMPTY_PCT      =  15
 GRID_DEADZONE_W        =  10
 BATTERY_TRICKLE_W      =  10
 
-PV_NAMEPLATE_WP       = 1200    # ← set to your actual panel nameplate Wp
-PV_ACTIVE_THRESHOLD_W = PV_NAMEPLATE_WP // 10   # 10% of nameplate = "PV is active"
-
 BATTERY_CHARGE_EFF     = 0.95   # energy stored per Wh drawn from grid/PV
 BATTERY_DISCHARGE_EFF  = 0.95   # energy delivered per Wh taken from battery
 # Round-trip = 0.95 × 0.95 = 0.9025 → ~10% total system loss
@@ -87,12 +84,14 @@ DISCHARGE_PENALTY      = 0.0001
 
 ALLOW_EXPORT           = False
 
+PV_NAMEPLATE_WP        = 3000   # nameplate peak power of PV system in Wp
+
 INFLUX_URL             = "http://localhost:8086/query"
 INFLUX_DB              = "homeassistant"
 INFLUX_USER            = "homeassistant"
 INFLUX_PASS            = "hainflux!"
 INFLUX_ENTITY          = "total_consumption"
-INFLUX_ENTITY_PV       = "ezhi_photovoltaic_power"   # entity_id for actual PV production
+INFLUX_ENTITY_PV       = "ezhi_photovoltaic_power"
 INFLUX_UNIT            = "W"
 
 SOLAR_BLEND_HOURS      = 2      # hours ahead over which actuals scale factor is blended
@@ -213,7 +212,6 @@ async def _get_solar_actuals() -> dict:
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     s_utc     = day_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     e_utc     = now.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
     q = (
         f'SELECT mean("value") FROM "{INFLUX_UNIT}" '
         f"WHERE \"entity_id\" = '{INFLUX_ENTITY_PV}' "
@@ -259,9 +257,7 @@ def _get_solar_forecast(actuals: dict) -> dict:
       - Beyond blend window:         pure Solcast forecast
 
     A scale factor is derived from the ratio of actuals to forecast for the
-    last 2 completed hours, correcting for systematic forecast bias on the day
-    (e.g. cloudier than expected → scale < 1.0 → LP is less optimistic about
-    free PV charging → more willing to use battery at current prices).
+    last 2 completed hours, correcting for systematic forecast bias on the day.
     """
     solar = {}
     now   = datetime.now(TZ)
@@ -290,7 +286,6 @@ def _get_solar_forecast(actuals: dict) -> dict:
             result[t.hour] = pv_kw * 1000
         return result
 
-    # --- Load Solcast forecast for today and tomorrow ---
     forecast = {}
     try:
         attrs  = state.getattr(E_SOLAR_TODAY) or {}
@@ -313,9 +308,7 @@ def _get_solar_forecast(actuals: dict) -> dict:
     except Exception as exc:
         log.warning(f"Solar tomorrow error: {exc}")
 
-    # --- Compute actuals-based scale factor ---
-    # Compare last 2 completed hours of actuals vs forecast.
-    # Clamped to [0.3, 2.0] to avoid wild outliers.
+    # Compute actuals-based scale factor from last 2 completed hours
     scale = 1.0
     comparison_hours = []
     for h in range(max(0, now.hour - 2), now.hour):
@@ -331,32 +324,24 @@ def _get_solar_forecast(actuals: dict) -> dict:
     else:
         log.info("PV scale factor: no comparison hours available, using 1.0")
 
-    # --- Build final blended solar dict ---
     for h in range(now.hour + 24):
         hour_of_day = h % 24
         hours_ahead = h - now.hour
 
         if hours_ahead < 0:
-            # Past: use actual if available, else raw forecast
             solar[hour_of_day] = actuals.get(hour_of_day, forecast.get(hour_of_day, 0.0))
-
         elif hours_ahead == 0:
-            # Current hour: 50/50 blend of actual and scaled forecast
             fc = forecast.get(hour_of_day, 0.0) * scale
             if hour_of_day in actuals:
                 solar[hour_of_day] = 0.5 * actuals[hour_of_day] + 0.5 * fc
             else:
                 solar[hour_of_day] = fc
-
         elif hours_ahead <= SOLAR_BLEND_HOURS:
-            # Near future: blend shifts from scaled forecast → pure forecast
             blend_weight        = hours_ahead / SOLAR_BLEND_HOURS
             scaled_fc           = forecast.get(hour_of_day, 0.0) * scale
             pure_fc             = forecast.get(hour_of_day, 0.0)
             solar[hour_of_day]  = (1 - blend_weight) * scaled_fc + blend_weight * pure_fc
-
         else:
-            # Far future: pure Solcast forecast
             solar[hour_of_day] = forecast.get(hour_of_day, 0.0)
 
     if solar:
@@ -378,7 +363,6 @@ def _get_solar_forecast(actuals: dict) -> dict:
                     log.info(f"  solar {h:02d}:00 = {solar[h]:.0f}W{actual_str}{fc_str}")
         return solar
 
-    # Last resort scalar fallback
     try:
         val = float(state.get(E_SOLAR_HOUR) or 0)
         solar[now.hour] = val
@@ -470,19 +454,18 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     solars = [s["solar"] for s in schedule]
     prices = [s["price"] for s in schedule]
 
-    # Per-slot PV surplus: energy that flows into the battery for free
-    # when solar > load. Capped at abs(OUTPUT_MIN_W) — inverter physical limit.
+    # Per-slot free PV charge: how much PV flows into the battery when b[t]=0.
+    # PV covers load first, remainder charges battery, capped at inverter limit.
     surplus = [
         min(max(0.0, solars[t] - loads[t]), abs(OUTPUT_MIN_W))
         for t in range(N)
     ]
 
-    # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = additional grid charge)
+    # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = grid charge)
     #            g[0..N-1] = grid import slack (always >= 0)
     #
     # Objective: minimise total grid cost.
-    #   Discharge reward discounted by BATTERY_DISCHARGE_EFF so the LP only
-    #   discharges when the price spread covers round-trip losses.
+    #   Discharge reward discounted by BATTERY_DISCHARGE_EFF.
     c_obj = []
     for t in range(N):
         c_obj.append(
@@ -493,25 +476,14 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         c_obj.append(prices[t] * DT / 1000.0)
 
     # Bounds: b in [OUTPUT_MIN_W, OUTPUT_MAX_W], g >= 0
-    #
-    # PV_ACTIVE_THRESHOLD_W = PV_NAMEPLATE_WP // 10
-    #
-    # When PV is actively producing (solar >= PV_ACTIVE_THRESHOLD_W):
-    #   - No grid charging allowed (lower bound = 0).
-    #     PV costs 0 ct/kWh by definition — there is never a rational reason
-    #     to grid-charge while PV is producing. Any LP decision to do so is a
-    #     modelling artifact, not genuine optimisation.
-    #   - Discharge capped to actual load (no battery-to-grid push).
-    #
-    # When PV is inactive (solar < PV_ACTIVE_THRESHOLD_W):
-    #   - Full grid charge/discharge range available.
+    # Discharge capped to load during PV production — no battery-to-grid push.
     bounds = []
     for t in range(N):
-        if solars[t] >= PV_ACTIVE_THRESHOLD_W:
+        if solars[t] >= PV_NAMEPLATE_WP / 10.0:
             max_disch = max(0.0, loads[t])
-            bounds.append((0.0, max_disch))          # PV active: no grid charge
         else:
-            bounds.append((float(OUTPUT_MIN_W), float(OUTPUT_MAX_W)))
+            max_disch = float(OUTPUT_MAX_W)
+        bounds.append((float(OUTPUT_MIN_W), max_disch))
     for t in range(N):
         bounds.append((0.0, None))
 
@@ -526,41 +498,55 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         A_ub.append(row)
         b_ub.append(solars[t] - loads[t])
 
-    # 2) SOC lower bound + 3) SOC upper bound.
+    # 2) SOC lower bound + 3) SOC upper bound with PV surplus credited.
     #
-    #   PV surplus charges the battery for free, slot by slot.
-    #   remaining_headroom tracks how much battery capacity is still
-    #   available AFTER accounting for PV already absorbed up to slot k.
-    #   The cap is applied per-slot against the shrinking headroom so the
-    #   LP correctly sees "battery will be full from PV alone by midday →
-    #   no grid charge needed before that".
-    remaining_headroom = E_max - E_now
-    cum_surplus_e      = 0.0
+    #   Key fix: remaining_headroom is initialised to include an estimate of
+    #   how much the battery will discharge BEFORE PV fills it (overnight drain,
+    #   morning load). Without this, the LP underestimates available PV headroom
+    #   on the next day and schedules unnecessary grid top-ups.
+    #
+    #   estimated_discharge_wh: total load covered by battery in non-PV slots,
+    #   weighted by current SOC relative to usable capacity — so a nearly-full
+    #   battery gets full credit, a nearly-empty one gets little.
+    pv_threshold = PV_NAMEPLATE_WP / 10.0
+    estimated_discharge_wh = sum(
+        max(0.0, loads[t]) * DT
+        for t in range(N)
+        if solars[t] < pv_threshold
+    ) * min(1.0, (E_now - E_min) / max(1.0, E_max - E_min))
+
+    remaining_headroom = min(
+        E_max - E_now + estimated_discharge_wh * BATTERY_DISCHARGE_EFF,
+        BATTERY_SIZE_WH * (BATTERY_FULL_PCT - BATTERY_EMPTY_PCT) / 100.0,
+    )
+    cum_surplus_e = 0.0
+
+    log.info(
+        f"LP headroom: E_now={E_now:.0f}Wh "
+        f"est_discharge={estimated_discharge_wh:.0f}Wh "
+        f"remaining_headroom={remaining_headroom:.0f}Wh"
+    )
 
     for k in range(N):
         absorbed           = min(surplus[k] * DT * BATTERY_CHARGE_EFF, remaining_headroom)
         remaining_headroom = max(0.0, remaining_headroom - absorbed)
         cum_surplus_e     += absorbed
 
-        # Lower bound: total discharge over [0..k] cannot exceed
-        # available energy + free PV already credited
+        # Lower bound: cumulative discharge cannot exceed available + PV credited
         row = [0.0] * (2 * N)
         for t in range(k + 1):
             row[t] = DT / BATTERY_DISCHARGE_EFF
         A_ub.append(row)
         b_ub.append(E_now - E_min + cum_surplus_e)
 
-        # Upper bound: total grid-charge over [0..k] cannot push SOC
-        # above E_max given what PV has already filled
+        # Upper bound: cumulative grid-charge cannot exceed headroom left after PV
         row = [0.0] * (2 * N)
         for t in range(k + 1):
             row[t] = -DT * BATTERY_CHARGE_EFF
         A_ub.append(row)
         b_ub.append(max(0.0, E_max - E_now - cum_surplus_e))
 
-    # 4) No-export: only when load >= solar (original form).
-    #    PV surplus slots handled via SOC credits above — no hard b[t] <= net
-    #    for surplus slots avoids infeasibility when battery is near full.
+    # 4) No-export: only when load >= solar.
     if not ALLOW_EXPORT:
         for t in range(N):
             net = loads[t] - solars[t]
@@ -605,15 +591,13 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         log.info(
             f"LP solved ✓ | Slot-0={optimal[0]:+d}W | "
             f"24h cost={total_cost:.4f} € | "
-            f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%} | "
-            f"PV threshold={PV_ACTIVE_THRESHOLD_W}W"
+            f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%}"
         )
         return optimal
 
     except Exception as exc:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
-
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -785,13 +769,11 @@ async def _log_24h_outlook(schedule: list, optimal_schedule: list, soc: float):
 
         soc_start = e / BATTERY_SIZE_WH * 100.0
 
-        # Free PV surplus this slot (capped at inverter charge limit)
         pv_surplus_slot = min(
             max(0.0, s["solar"] - s["cons"]),
             abs(OUTPUT_MIN_W)
         )
 
-        # Track SOC using same efficiency model as LP
         if sp > 0:
             e_after = e - sp * DT / BATTERY_DISCHARGE_EFF
         else:
@@ -1057,8 +1039,8 @@ async def strategic_optimize():
             )
         elif mode == "TRICKLE" and soc >= BATTERY_FULL_PCT:
             reason = (
-                f"Battery full ({soc:.0f}%). Holding SOC in "
-                f"{BATTERY_TRICKLE_PCT}–{BATTERY_FULL_PCT}% band. "
+                f"Battery full ({soc:.0f}%). Holding at 0W. "
+                f"PV covers load, battery floats. "
                 f"Price: {price * 100:.1f} ct/kWh."
             )
         elif mode == "TRICKLE":
@@ -1070,7 +1052,7 @@ async def strategic_optimize():
         elif mode == "BALANCE" and soc >= BATTERY_FULL_PCT and net < -GRID_DEADZONE_W:
             reason = (
                 f"Battery full ({soc:.0f}%) with PV surplus {abs(net):.0f}W. "
-                f"Spilling {sp:+d}W. Price: {price * 100:.1f} ct/kWh."
+                f"Price: {price * 100:.1f} ct/kWh."
             )
         else:
             if USE_LP_OPTIMIZER:
