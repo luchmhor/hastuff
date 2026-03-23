@@ -84,7 +84,7 @@ DISCHARGE_PENALTY      = 0.0001
 
 ALLOW_EXPORT           = False
 
-PV_NAMEPLATE_WP        = 3000   # nameplate peak power of PV system in Wp
+PV_NAMEPLATE_WP        = 1200   # nameplate peak power of PV system in Wp
 
 INFLUX_URL             = "http://localhost:8086/query"
 INFLUX_DB              = "homeassistant"
