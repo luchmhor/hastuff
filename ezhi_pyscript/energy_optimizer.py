@@ -73,6 +73,9 @@ BATTERY_EMPTY_PCT      =  15
 GRID_DEADZONE_W        =  10
 BATTERY_TRICKLE_W      =  10
 
+PV_NAMEPLATE_WP       = 1200    # ← set to your actual panel nameplate Wp
+PV_ACTIVE_THRESHOLD_W = PV_NAMEPLATE_WP // 10   # 10% of nameplate = "PV is active"
+
 BATTERY_CHARGE_EFF     = 0.95   # energy stored per Wh drawn from grid/PV
 BATTERY_DISCHARGE_EFF  = 0.95   # energy delivered per Wh taken from battery
 # Round-trip = 0.95 × 0.95 = 0.9025 → ~10% total system loss
@@ -490,14 +493,25 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         c_obj.append(prices[t] * DT / 1000.0)
 
     # Bounds: b in [OUTPUT_MIN_W, OUTPUT_MAX_W], g >= 0
-    # During PV-active slots cap discharge to actual load — no battery-to-grid push.
+    #
+    # PV_ACTIVE_THRESHOLD_W = PV_NAMEPLATE_WP // 10
+    #
+    # When PV is actively producing (solar >= PV_ACTIVE_THRESHOLD_W):
+    #   - No grid charging allowed (lower bound = 0).
+    #     PV costs 0 ct/kWh by definition — there is never a rational reason
+    #     to grid-charge while PV is producing. Any LP decision to do so is a
+    #     modelling artifact, not genuine optimisation.
+    #   - Discharge capped to actual load (no battery-to-grid push).
+    #
+    # When PV is inactive (solar < PV_ACTIVE_THRESHOLD_W):
+    #   - Full grid charge/discharge range available.
     bounds = []
     for t in range(N):
-        if solars[t] > GRID_DEADZONE_W:
+        if solars[t] >= PV_ACTIVE_THRESHOLD_W:
             max_disch = max(0.0, loads[t])
+            bounds.append((0.0, max_disch))          # PV active: no grid charge
         else:
-            max_disch = float(OUTPUT_MAX_W)
-        bounds.append((float(OUTPUT_MIN_W), max_disch))
+            bounds.append((float(OUTPUT_MIN_W), float(OUTPUT_MAX_W)))
     for t in range(N):
         bounds.append((0.0, None))
 
@@ -591,13 +605,15 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         log.info(
             f"LP solved ✓ | Slot-0={optimal[0]:+d}W | "
             f"24h cost={total_cost:.4f} € | "
-            f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%}"
+            f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%} | "
+            f"PV threshold={PV_ACTIVE_THRESHOLD_W}W"
         )
         return optimal
 
     except Exception as exc:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
