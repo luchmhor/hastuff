@@ -460,10 +460,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         for t in range(N)
     ]
 
-    # Maximum future price in the horizon — used to compute opportunity cost.
-    # Discharging now at a cheap price foregoes saving/earning at the peak price.
-    # The opportunity cost term makes the LP strongly prefer holding SOC when a
-    # much more expensive slot is coming, without any fixed reserve heuristic.
+    # Maximum/minimum future price in horizon for opportunity cost calculation.
     price_max = max(prices)
     price_min = min(prices)
 
@@ -474,22 +471,16 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     #
     #   Discharge term per slot:
     #     base reward:        -prices[t] * DISCHARGE_EFF  (saves grid import)
-    #     opportunity cost:   +(price_max - prices[t]) * DISCHARGE_EFF * 0.5
-    #                         penalises discharging cheap when peak is ahead
+    #     opportunity cost:   +(price_max - prices[t]) * DISCHARGE_EFF * weight
+    #                         penalises discharging cheap when a peak is ahead —
+    #                         the LP naturally holds SOC for high-value slots
+    #                         without any fixed reserve heuristic
     #     wear penalty:       +DISCHARGE_PENALTY  (tiny tiebreaker)
     #
-    #   The opportunity cost weight 0.5 means:
-    #     discharging at price P costs an extra (price_max - P) * 0.5 * EFF
-    #     → at night (8 ct) with morning peak (28 ct): extra ~0.0024 €/slot
-    #     → at peak (28 ct) with no higher price ahead: extra ~0 €/slot
-    #     → LP naturally holds SOC for high-value slots without a fixed reserve
-    #
-    #   OPPORTUNITY_COST_WEIGHT is tunable:
-    #     0.0 = disabled (current behaviour, drains overnight)
-    #     0.5 = balanced (recommended default)
-    #     1.0 = fully conservative (never discharges below max-price opportunity)
-    OPPORTUNITY_COST_WEIGHT = 0.5
-
+    #   OPPORTUNITY_COST_WEIGHT:
+    #     0.0 = disabled (drains overnight freely)
+    #     0.5 = balanced, recommended default
+    #     1.0 = fully conservative (never discharges below peak opportunity)
     c_obj = []
     for t in range(N):
         opportunity_cost = (
@@ -505,7 +496,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         c_obj.append(prices[t] * DT / 1000.0)
 
     # Bounds: discharge capped to load during PV production — no battery-to-grid.
-    # Grid charging allowed in all slots (objective penalty discourages it during PV).
+    # Grid charging allowed in all slots (objective handles PV-hour discouragement).
     pv_threshold = PV_NAMEPLATE_WP / 10.0
     bounds = []
     for t in range(N):
@@ -530,13 +521,14 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
 
     # 2) SOC lower bound + 3) SOC upper bound with PV surplus credited.
     #
-    #   remaining_headroom is initialised to include estimated overnight discharge
-    #   so the LP correctly values PV headroom for the next day's charging.
-    estimated_discharge_wh = sum(
+    #   remaining_headroom includes estimated overnight/non-PV discharge so the
+    #   LP correctly values tomorrow's PV charging capacity.
+    #   Uses list comprehension — pyscript does not support generator expressions.
+    estimated_discharge_wh = sum([
         max(0.0, loads[t]) * DT
         for t in range(N)
         if solars[t] < pv_threshold
-    ) * min(1.0, (E_now - E_min) / max(1.0, E_max - E_min))
+    ]) * min(1.0, (E_now - E_min) / max(1.0, E_max - E_min))
 
     remaining_headroom = min(
         E_max - E_now + estimated_discharge_wh * BATTERY_DISCHARGE_EFF,
@@ -548,7 +540,8 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         f"LP headroom: E_now={E_now:.0f}Wh "
         f"est_discharge={estimated_discharge_wh:.0f}Wh "
         f"remaining_headroom={remaining_headroom:.0f}Wh | "
-        f"price_min={price_min * 100:.1f} price_max={price_max * 100:.1f} ct"
+        f"price_min={price_min * 100:.1f} price_max={price_max * 100:.1f} ct | "
+        f"OC_weight={OPPORTUNITY_COST_WEIGHT}"
     )
 
     for k in range(N):
@@ -623,7 +616,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     except Exception as exc:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
-
 
 
 # ════════════════════════════════════════════════════════════════════════════
