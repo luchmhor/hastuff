@@ -454,32 +454,62 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     solars = [s["solar"] for s in schedule]
     prices = [s["price"] for s in schedule]
 
-    # Per-slot free PV charge: how much PV flows into the battery when b[t]=0.
-    # PV covers load first, remainder charges battery, capped at inverter limit.
+    # Per-slot free PV charge: surplus above load, capped at inverter limit.
     surplus = [
         min(max(0.0, solars[t] - loads[t]), abs(OUTPUT_MIN_W))
         for t in range(N)
     ]
 
+    # Maximum future price in the horizon — used to compute opportunity cost.
+    # Discharging now at a cheap price foregoes saving/earning at the peak price.
+    # The opportunity cost term makes the LP strongly prefer holding SOC when a
+    # much more expensive slot is coming, without any fixed reserve heuristic.
+    price_max = max(prices)
+    price_min = min(prices)
+
     # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = grid charge)
     #            g[0..N-1] = grid import slack (always >= 0)
     #
     # Objective: minimise total grid cost.
-    #   Discharge reward discounted by BATTERY_DISCHARGE_EFF.
+    #
+    #   Discharge term per slot:
+    #     base reward:        -prices[t] * DISCHARGE_EFF  (saves grid import)
+    #     opportunity cost:   +(price_max - prices[t]) * DISCHARGE_EFF * 0.5
+    #                         penalises discharging cheap when peak is ahead
+    #     wear penalty:       +DISCHARGE_PENALTY  (tiny tiebreaker)
+    #
+    #   The opportunity cost weight 0.5 means:
+    #     discharging at price P costs an extra (price_max - P) * 0.5 * EFF
+    #     → at night (8 ct) with morning peak (28 ct): extra ~0.0024 €/slot
+    #     → at peak (28 ct) with no higher price ahead: extra ~0 €/slot
+    #     → LP naturally holds SOC for high-value slots without a fixed reserve
+    #
+    #   OPPORTUNITY_COST_WEIGHT is tunable:
+    #     0.0 = disabled (current behaviour, drains overnight)
+    #     0.5 = balanced (recommended default)
+    #     1.0 = fully conservative (never discharges below max-price opportunity)
+    OPPORTUNITY_COST_WEIGHT = 0.5
+
     c_obj = []
     for t in range(N):
+        opportunity_cost = (
+            (price_max - prices[t]) * BATTERY_DISCHARGE_EFF * DT / 1000.0
+            * OPPORTUNITY_COST_WEIGHT
+        )
         c_obj.append(
             -prices[t] * BATTERY_DISCHARGE_EFF * DT / 1000.0
+            + opportunity_cost
             + DISCHARGE_PENALTY * DT / 1000.0
         )
     for t in range(N):
         c_obj.append(prices[t] * DT / 1000.0)
 
-    # Bounds: b in [OUTPUT_MIN_W, OUTPUT_MAX_W], g >= 0
-    # Discharge capped to load during PV production — no battery-to-grid push.
+    # Bounds: discharge capped to load during PV production — no battery-to-grid.
+    # Grid charging allowed in all slots (objective penalty discourages it during PV).
+    pv_threshold = PV_NAMEPLATE_WP / 10.0
     bounds = []
     for t in range(N):
-        if solars[t] >= PV_NAMEPLATE_WP / 10.0:
+        if solars[t] >= pv_threshold:
             max_disch = max(0.0, loads[t])
         else:
             max_disch = float(OUTPUT_MAX_W)
@@ -500,15 +530,8 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
 
     # 2) SOC lower bound + 3) SOC upper bound with PV surplus credited.
     #
-    #   Key fix: remaining_headroom is initialised to include an estimate of
-    #   how much the battery will discharge BEFORE PV fills it (overnight drain,
-    #   morning load). Without this, the LP underestimates available PV headroom
-    #   on the next day and schedules unnecessary grid top-ups.
-    #
-    #   estimated_discharge_wh: total load covered by battery in non-PV slots,
-    #   weighted by current SOC relative to usable capacity — so a nearly-full
-    #   battery gets full credit, a nearly-empty one gets little.
-    pv_threshold = PV_NAMEPLATE_WP / 10.0
+    #   remaining_headroom is initialised to include estimated overnight discharge
+    #   so the LP correctly values PV headroom for the next day's charging.
     estimated_discharge_wh = sum(
         max(0.0, loads[t]) * DT
         for t in range(N)
@@ -524,7 +547,8 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     log.info(
         f"LP headroom: E_now={E_now:.0f}Wh "
         f"est_discharge={estimated_discharge_wh:.0f}Wh "
-        f"remaining_headroom={remaining_headroom:.0f}Wh"
+        f"remaining_headroom={remaining_headroom:.0f}Wh | "
+        f"price_min={price_min * 100:.1f} price_max={price_max * 100:.1f} ct"
     )
 
     for k in range(N):
@@ -591,13 +615,15 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         log.info(
             f"LP solved ✓ | Slot-0={optimal[0]:+d}W | "
             f"24h cost={total_cost:.4f} € | "
-            f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%}"
+            f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%} | "
+            f"OC_weight={OPPORTUNITY_COST_WEIGHT}"
         )
         return optimal
 
     except Exception as exc:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
