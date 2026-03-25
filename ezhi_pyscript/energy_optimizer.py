@@ -445,28 +445,25 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     """
     Clean multi-period LP formulation.
 
-    Variables (all >= 0, 3*N + N = 4*N total):
-      p_charge[t]     W  drawn from grid into battery
-      p_discharge[t]  W  pushed from battery to load
-      p_grid[t]       W  imported from grid to cover load
-      e[t]            Wh battery energy at END of slot t  (free variable, bounded)
+    Variables (all >= 0, 4*N total):
+      p_charge[t]     W  power into battery (from grid or PV surplus)
+      p_discharge[t]  W  power from battery to load
+      p_grid[t]       W  power imported from grid  (>= 0, no export)
+      e[t]            Wh battery energy at END of slot t
 
-    Objective: minimise total grid spend over horizon
-      sum_t [ (p_grid[t] + p_charge[t]) * prices[t] * DT/1000 ]
-      discharge saves money by displacing grid import — captured via power balance.
+    Objective:
+      minimise sum_t [ (p_grid[t] + p_charge[t]) * prices[t] * DT/1000 ]
 
-    Power balance (equality per slot):
-      p_grid[t] + p_discharge[t] + solar[t] = load[t] + p_charge[t]
-      → p_grid[t] = load[t] + p_charge[t] - p_discharge[t] - solar[t]
-      → since p_grid >= 0 this naturally prevents over-discharge past load+solar.
+    Power balance (inequality — grid covers any shortfall):
+      p_grid[t] >= load[t] + p_charge[t] - p_discharge[t] - solar[t]
+      p_grid[t] >= 0  (bounds)
 
-    SOC dynamics (equality per slot):
-      e[t] = e[t-1] + p_charge[t]*DT*CHARGE_EFF - p_discharge[t]*DT/DISCHARGE_EFF
-      e[-1] = E_now  (initial condition)
+    SOC dynamics (equality):
+      e[t] = e[t-1] + p_charge[t]*DT*CHARGE_EFF - p_discharge[t]*DT/DISC_EFF
+      e[-1] = E_now
 
-    No penalty terms, no opportunity cost heuristics — arbitrage between cheap
-    charge slots and expensive discharge slots emerges automatically from the
-    joint optimisation across all 96 slots.
+    SOC bounds:
+      E_min <= e[t] <= E_max  (bounds)
     """
     N  = len(schedule)
     DT = 0.25
@@ -480,10 +477,10 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     prices = [s["price"] for s in schedule]
 
     pv_threshold = PV_NAMEPLATE_WP / 10.0
+    price_min    = min(prices)
+    price_max    = max(prices)
+    price_avg    = sum(prices) / len(prices)
 
-    price_min = min(prices)
-    price_max = max(prices)
-    price_avg = sum(prices) / len(prices)
     log.info(
         f"LP (clean): E_now={E_now:.0f}Wh | "
         f"price_min={price_min*100:.1f} avg={price_avg*100:.1f} "
@@ -491,94 +488,69 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     )
 
     # ── Variable index helpers ────────────────────────────────────────────────
-    # Layout: [p_charge(0..N-1) | p_discharge(0..N-1) | p_grid(0..N-1) | e(0..N-1)]
-    def ic(t): return t            # p_charge index
-    def id(t): return N + t        # p_discharge index
-    def ig(t): return 2 * N + t    # p_grid index
-    def ie(t): return 3 * N + t    # e index
+    # [p_charge(0..N-1) | p_discharge(0..N-1) | p_grid(0..N-1) | e(0..N-1)]
+    def ic(t): return t
+    def id(t): return N + t
+    def ig(t): return 2 * N + t
+    def ie(t): return 3 * N + t
     NVARS = 4 * N
 
     # ── Objective ─────────────────────────────────────────────────────────────
-    # minimise sum_t [ (p_grid[t] + p_charge[t]) * prices[t] * DT/1000 ]
     c_obj = [0.0] * NVARS
     for t in range(N):
-        c_obj[ic(t)] = prices[t] * DT / 1000.0   # charge cost
-        c_obj[ig(t)] = prices[t] * DT / 1000.0   # grid import cost
+        c_obj[ic(t)] = prices[t] * DT / 1000.0   # cost of charging from grid
+        c_obj[ig(t)] = prices[t] * DT / 1000.0   # cost of grid import for load
 
     # ── Bounds ────────────────────────────────────────────────────────────────
     bounds = [None] * NVARS
-
     for t in range(N):
-        # p_charge: 0 to max inverter charge rate
-        bounds[ic(t)] = (0.0, abs(OUTPUT_MIN_W))
+        bounds[ic(t)] = (0.0, float(abs(OUTPUT_MIN_W)))
 
-        # p_discharge: 0 to max inverter discharge rate
-        # capped to load during PV production — no battery-to-grid push
         if solars[t] >= pv_threshold:
             max_disch = max(0.0, loads[t])
         else:
             max_disch = float(OUTPUT_MAX_W)
         bounds[id(t)] = (0.0, max_disch)
 
-        # p_grid: 0 to unconstrained (only import, no export)
         bounds[ig(t)] = (0.0, None)
-
-        # e: battery energy between E_min and E_max
         bounds[ie(t)] = (E_min, E_max)
 
-    # ── Equality constraints ──────────────────────────────────────────────────
-    # scipy linprog takes A_eq, b_eq for Ax = b.
-    # Two sets: power balance + SOC dynamics, each N equations.
+    # ── Inequality constraints (A_ub @ x <= b_ub) ────────────────────────────
+    A_ub = []
+    b_ub = []
+
+    # Power balance: p_grid[t] >= load[t] + p_charge[t] - p_discharge[t] - solar[t]
+    # → -p_grid[t] - p_discharge[t] + p_charge[t] <= solar[t] - load[t]
+    for t in range(N):
+        row = [0.0] * NVARS
+        row[ic(t)] =  1.0
+        row[id(t)] = -1.0
+        row[ig(t)] = -1.0
+        A_ub.append(row)
+        b_ub.append(solars[t] - loads[t])
+
+    # ── Equality constraints (A_eq @ x = b_eq) ───────────────────────────────
+    # SOC dynamics only: e[t] = e[t-1] + charge_effect - discharge_effect
     A_eq = []
     b_eq = []
 
     for t in range(N):
-        # Power balance:
-        #   p_grid[t] + p_discharge[t] + solar[t] = load[t] + p_charge[t]
-        #   → p_charge[t] - p_discharge[t] + p_grid[t] = solar[t] - load[t]  [× -1 for convention]
-        #   → -p_charge[t] + p_discharge[t] - p_grid[t] = load[t] - solar[t]
         row = [0.0] * NVARS
-        row[ic(t)] = -1.0
-        row[id(t)] =  1.0
-        row[ig(t)] = -1.0
-        A_eq.append(row)
-        b_eq.append(loads[t] - solars[t])
-
-    for t in range(N):
-        # SOC dynamics:
-        #   e[t] - e[t-1] = p_charge[t]*DT*CHARGE_EFF - p_discharge[t]*DT/DISCHARGE_EFF
-        #   → -p_charge[t]*DT*CHARGE_EFF + p_discharge[t]*DT/DISCHARGE_EFF + e[t] - e[t-1] = 0
-        row = [0.0] * NVARS
-        row[ic(t)] = -DT * BATTERY_CHARGE_EFF
-        row[id(t)] =  DT / BATTERY_DISCHARGE_EFF
+        row[ic(t)] = -DT * BATTERY_CHARGE_EFF       # charging increases e
+        row[id(t)] =  DT / BATTERY_DISCHARGE_EFF     # discharging decreases e
         row[ie(t)] =  1.0
         if t > 0:
             row[ie(t - 1)] = -1.0
-        A_eq.append(row)
-        # e[-1] = E_now for t=0
-        b_eq.append(0.0 if t > 0 else -E_now * (-1.0) - E_now + E_now)
-
-    # Fix b_eq for t=0 correctly:
-    #   e[0] - E_now = p_charge[0]*DT*CEff - p_discharge[0]*DT/DEff
-    #   → b_eq[N+0] = E_now  ... let's rewrite cleanly:
-    for t in range(N):
-        idx = N + t
-        if t == 0:
-            b_eq[idx] = E_now   # e[0] = E_now + charge_effect - discharge_effect
-                                 # rearranged: e[0] - charge + discharge/eff = E_now
+            b_eq.append(0.0)
         else:
-            b_eq[idx] = 0.0
-
-    # ── No-export inequality ──────────────────────────────────────────────────
-    # p_grid[t] >= 0 already enforced by bounds.
-    # Additional: if ALLOW_EXPORT=False, p_discharge[t] <= load[t] + p_charge[t]
-    # (cannot push more to grid than load consumes, already implied by power
-    # balance + p_grid >= 0, so no extra constraint needed here)
+            b_eq.append(E_now)                       # e[0] anchored to E_now
+        A_eq.append(row)
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     try:
         result = linprog(
             c_obj,
+            A_ub=A_ub, b_ub=b_ub,
             A_eq=A_eq, b_eq=b_eq,
             bounds=bounds,
             method="highs",
@@ -594,8 +566,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         p_grid      = [result.x[ig(t)] for t in range(N)]
         e_end       = [result.x[ie(t)] for t in range(N)]
 
-        # Convert to inverter setpoint convention:
-        #   positive = discharge, negative = charge
+        # Inverter setpoint convention: positive = discharge, negative = charge
         optimal = []
         for t in range(N):
             net_sp = int(round((p_discharge[t] - p_charge[t]) / 10) * 10)
@@ -606,7 +577,6 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             (p_grid[t] + p_charge[t]) * prices[t] * DT / 1000.0
             for t in range(N)
         ])
-
         soc_end = e_end[-1] / BATTERY_SIZE_WH * 100.0
 
         log.info(
@@ -618,7 +588,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
 
         if LOG_DEBUG:
             e = E_now
-            for t in range(min(N, 96)):
+            for t in range(N):
                 s         = schedule[t]
                 soc_t     = e / BATTERY_SIZE_WH * 100.0
                 grid_show = p_grid[t] + p_charge[t]
