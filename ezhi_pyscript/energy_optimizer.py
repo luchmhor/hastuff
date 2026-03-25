@@ -80,9 +80,6 @@ BATTERY_DISCHARGE_EFF  = 0.95   # energy delivered per Wh taken from battery
 NETWORK_FEE_CT_PER_KWH = 10.5
 SCHEDULE_SLOTS         = 96     # number of 15-min slots (96 = 24 h)
 
-DISCHARGE_PENALTY      = 0.0001
-OPPORTUNITY_COST_WEIGHT  = 0.5   # 0.0 = disabled, 0.5 = balanced, 1.0 = fully conservative
-
 ALLOW_EXPORT           = False
 
 PV_NAMEPLATE_WP        = 1200   # nameplate peak power of PV system in Wp
