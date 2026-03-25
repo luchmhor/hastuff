@@ -80,6 +80,9 @@ BATTERY_DISCHARGE_EFF  = 0.95   # energy delivered per Wh taken from battery
 NETWORK_FEE_CT_PER_KWH = 10.5
 SCHEDULE_SLOTS         = 96     # number of 15-min slots (96 = 24 h)
 
+DISCHARGE_PENALTY      = 0.0001
+OPPORTUNITY_COST_WEIGHT  = 0.5   # 0.0 = disabled, 0.5 = balanced, 1.0 = fully conservative
+
 ALLOW_EXPORT           = False
 
 PV_NAMEPLATE_WP        = 1200   # nameplate peak power of PV system in Wp
@@ -441,19 +444,9 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
 # LP OPTIMIZER
 # ════════════════════════════════════════════════════════════════════════════
 
-def _solve_optimal_schedule(soc, schedule):
-    """
-    5-variable-per-slot LP.
-    Variable layout per slot t (N slots total):
-      index t        = p_chg_grid[t]   W  grid -> battery
-      index N+t      = p_chg_pv[t]     W  PV surplus -> battery (free)
-      index 2*N+t    = p_discharge[t]  W  battery -> load
-      index 3*N+t    = p_grid[t]       W  grid -> load
-      index 4*N+t    = e[t]            Wh battery energy end of slot
-    """
-    N  = len(schedule)
-    DT = 0.25
-
+def _solve_optimal_schedule(soc: float, schedule: list) -> list:
+    N     = len(schedule)
+    DT    = 0.25
     E_now = soc / 100.0 * BATTERY_SIZE_WH
     E_min = BATTERY_EMPTY_PCT / 100.0 * BATTERY_SIZE_WH
     E_max = BATTERY_FULL_PCT  / 100.0 * BATTERY_SIZE_WH
@@ -462,135 +455,189 @@ def _solve_optimal_schedule(soc, schedule):
     solars = [s["solar"] for s in schedule]
     prices = [s["price"] for s in schedule]
 
+    # Per-slot free PV charge: surplus above load, capped at inverter limit.
+    surplus = [
+        min(max(0.0, solars[t] - loads[t]), abs(OUTPUT_MIN_W))
+        for t in range(N)
+    ]
+
+    price_max = max(prices)
+    price_min = min(prices)
+    price_avg = sum(prices) / len(prices)
+
+    # Variables: b[0..N-1] = battery setpoint (+ = discharge, - = grid charge)
+    #            g[0..N-1] = grid import slack (always >= 0)
+    #
+    # Objective: minimise total grid cost.
+    #
+    #   Discharge term:
+    #     base reward:        -prices[t] * DISCHARGE_EFF
+    #     opportunity cost:   +(price_max - prices[t]) * DISCHARGE_EFF * WEIGHT
+    #       → penalises discharging at cheap prices when peak is ahead
+    #       → makes LP hold SOC for high-value slots
+    #
+    #   Charge term:
+    #     base cost:          +prices[t]
+    #     cheap-charge bonus: -max(0, price_avg - prices[t]) * CHARGE_EFF * WEIGHT
+    #       → rewards charging when price is below average
+    #       → makes LP actively seek cheapest charging slots and split
+    #          discharge blocks to grab cheap windows in between
+    #
+    #   Together these two terms make the LP behave symmetrically:
+    #     - hold discharge for expensive slots
+    #     - seek charge at cheap slots
+    #   Without the cheap-charge bonus the LP only charges when forced (SOC low),
+    #   never opportunistically — causing it to miss cheap overnight windows.
+    c_obj = []
+    for t in range(N):
+        opportunity_cost = (
+            (price_max - prices[t]) * BATTERY_DISCHARGE_EFF * DT / 1000.0
+            * OPPORTUNITY_COST_WEIGHT
+        )
+        c_obj.append(
+            -prices[t] * BATTERY_DISCHARGE_EFF * DT / 1000.0
+            + opportunity_cost
+            + DISCHARGE_PENALTY * DT / 1000.0
+        )
+    for t in range(N):
+        cheap_bonus = (
+            max(0.0, price_avg - prices[t]) * BATTERY_CHARGE_EFF * DT / 1000.0
+            * OPPORTUNITY_COST_WEIGHT
+        )
+        c_obj.append(prices[t] * DT / 1000.0 - cheap_bonus)
+
+    # Bounds: discharge capped to load during PV production — no battery-to-grid.
     pv_threshold = PV_NAMEPLATE_WP / 10.0
-    price_avg    = sum(prices) / N
-
-    log.info(
-        f"LP (5-var): E_now={E_now:.0f}Wh "
-        f"price min={min(prices)*100:.1f} avg={price_avg*100:.1f} "
-        f"max={max(prices)*100:.1f} ct"
-    )
-
-    NVARS = 5 * N
-
-    # ── Objective ─────────────────────────────────────────────────────────────
-    c_obj = [0.0] * NVARS
+    bounds = []
     for t in range(N):
-        c_obj[t]       = prices[t] * DT / 1000.0   # p_chg_grid cost
-        c_obj[3*N + t] = prices[t] * DT / 1000.0   # p_grid cost
-
-    # ── Bounds ────────────────────────────────────────────────────────────────
-    bounds = [None] * NVARS
-    for t in range(N):
-        bounds[t]       = (0.0, float(abs(OUTPUT_MIN_W)))
-
-        pv_surplus = max(0.0, solars[t] - loads[t])
-        bounds[N + t]   = (0.0, pv_surplus)
-
         if solars[t] >= pv_threshold:
             max_disch = max(0.0, loads[t])
         else:
             max_disch = float(OUTPUT_MAX_W)
-        bounds[2*N + t] = (0.0, max_disch)
+        bounds.append((float(OUTPUT_MIN_W), max_disch))
+    for t in range(N):
+        bounds.append((0.0, None))
 
-        bounds[3*N + t] = (0.0, None)
-        bounds[4*N + t] = (E_min, E_max)
-
-    # ── Inequality: p_grid covers load shortfall ──────────────────────────────
-    # p_chg_grid[t] - p_discharge[t] - p_grid[t] <= solar[t] - load[t]
     A_ub = []
     b_ub = []
+
+    # 1) Grid import slack: g[t] >= load[t] - solar[t] - b[t]
     for t in range(N):
-        row = [0.0] * NVARS
-        row[t]       =  1.0
-        row[2*N + t] = -1.0
-        row[3*N + t] = -1.0
+        row        = [0.0] * (2 * N)
+        row[t]     = -1.0
+        row[N + t] = -1.0
         A_ub.append(row)
         b_ub.append(solars[t] - loads[t])
 
-    # ── Equality: SOC dynamics ────────────────────────────────────────────────
-    # e[t] = e[t-1]
-    #      + (p_chg_grid[t] + p_chg_pv[t]) * DT * CHARGE_EFF
-    #      -  p_discharge[t] * DT / DISCHARGE_EFF
-    # rearranged (all on lhs):
-    #   -p_chg_grid*DT*CEFF - p_chg_pv*DT*CEFF + p_disch*DT/DEFF + e[t] - e[t-1] = 0
-    #   for t=0: e[-1] = E_now, so b = E_now
-    A_eq = []
-    b_eq = []
+    # 2) SOC lower bound + 3) SOC upper bound with PV surplus credited.
+    #
+    #   estimated_discharge_wh only counts slots AFTER today's last PV-active
+    #   slot — prevents phantom headroom inflation during sunny mornings.
+    last_pv_slot = -1
     for t in range(N):
-        row = [0.0] * NVARS
-        row[t]       = -DT * BATTERY_CHARGE_EFF
-        row[N + t]   = -DT * BATTERY_CHARGE_EFF
-        row[2*N + t] =  DT / BATTERY_DISCHARGE_EFF
-        row[4*N + t] =  1.0
-        if t > 0:
-            row[4*N + t - 1] = -1.0
-            b_eq.append(0.0)
-        else:
-            b_eq.append(E_now)
-        A_eq.append(row)
+        if solars[t] >= pv_threshold:
+            last_pv_slot = t
 
-    # ── Solve ─────────────────────────────────────────────────────────────────
+    soc_weight = min(1.0, (E_now - E_min) / max(1.0, E_max - E_min))
+
+    estimated_discharge_wh = sum([
+        max(0.0, loads[t]) * DT
+        for t in range(N)
+        if t > last_pv_slot and solars[t] < pv_threshold
+    ]) * soc_weight
+
+    remaining_headroom = min(
+        E_max - E_now + estimated_discharge_wh * BATTERY_DISCHARGE_EFF,
+        BATTERY_SIZE_WH * (BATTERY_FULL_PCT - BATTERY_EMPTY_PCT) / 100.0,
+    )
+    cum_surplus_e = 0.0
+
+    log.info(
+        f"LP headroom: E_now={E_now:.0f}Wh "
+        f"last_pv_slot={last_pv_slot} "
+        f"est_discharge={estimated_discharge_wh:.0f}Wh "
+        f"remaining_headroom={remaining_headroom:.0f}Wh | "
+        f"price_min={price_min * 100:.1f} "
+        f"price_avg={price_avg * 100:.1f} "
+        f"price_max={price_max * 100:.1f} ct | "
+        f"OC_weight={OPPORTUNITY_COST_WEIGHT}"
+    )
+
+    for k in range(N):
+        absorbed           = min(surplus[k] * DT * BATTERY_CHARGE_EFF, remaining_headroom)
+        remaining_headroom = max(0.0, remaining_headroom - absorbed)
+        cum_surplus_e     += absorbed
+
+        # Lower bound: cumulative discharge cannot exceed available + PV credited
+        row = [0.0] * (2 * N)
+        for t in range(k + 1):
+            row[t] = DT / BATTERY_DISCHARGE_EFF
+        A_ub.append(row)
+        b_ub.append(E_now - E_min + cum_surplus_e)
+
+        # Upper bound: cumulative grid-charge cannot exceed headroom left after PV
+        row = [0.0] * (2 * N)
+        for t in range(k + 1):
+            row[t] = -DT * BATTERY_CHARGE_EFF
+        A_ub.append(row)
+        b_ub.append(max(0.0, E_max - E_now - cum_surplus_e))
+
+    # 4) No-export: only when load >= solar.
+    if not ALLOW_EXPORT:
+        for t in range(N):
+            net = loads[t] - solars[t]
+            if net >= 0:
+                row    = [0.0] * (2 * N)
+                row[t] = 1.0
+                A_ub.append(row)
+                b_ub.append(net)
+
     try:
-        result = linprog(
-            c_obj,
-            A_ub=A_ub, b_ub=b_ub,
-            A_eq=A_eq, b_eq=b_eq,
-            bounds=bounds,
-            method="highs",
-        )
-
+        result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
         if result.status != 0:
-            log.warning(f"LP status {result.status}: {result.message} - fallback")
+            log.warning(f"LP status {result.status}: {result.message} — fallback")
             return _heuristic_schedule(soc, schedule)
 
-        # ── Extract ───────────────────────────────────────────────────────────
-        p_chg_grid  = [result.x[t]       for t in range(N)]
-        p_chg_pv    = [result.x[N + t]   for t in range(N)]
-        p_discharge = [result.x[2*N + t] for t in range(N)]
-        p_grid      = [result.x[3*N + t] for t in range(N)]
-        e_end       = [result.x[4*N + t] for t in range(N)]
-
         optimal = []
+        e       = E_now
         for t in range(N):
-            total_charge = p_chg_grid[t] + p_chg_pv[t]
-            net_sp = int(round((p_discharge[t] - total_charge) / 10) * 10)
-            net_sp = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, net_sp))
-            optimal.append(net_sp)
+            sp = int(round(result.x[t] / 10) * 10)
+            sp = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, sp))
+            optimal.append(sp)
+            if sp > 0:
+                e -= sp * DT / BATTERY_DISCHARGE_EFF
+            else:
+                e -= sp * DT * BATTERY_CHARGE_EFF
+            e += surplus[t] * DT * BATTERY_CHARGE_EFF
+            e  = max(E_min, min(E_max, e))
 
         total_cost = 0.0
+        e = E_now
         for t in range(N):
-            total_cost += (p_grid[t] + p_chg_grid[t]) * prices[t] * DT / 1000.0
-
-        soc_end = e_end[-1] / BATTERY_SIZE_WH * 100.0
+            grid_w = loads[t] - solars[t] - optimal[t]
+            if grid_w > 0:
+                total_cost += grid_w * prices[t] * DT / 1000.0
+            if optimal[t] > 0:
+                e -= optimal[t] * DT / BATTERY_DISCHARGE_EFF
+            else:
+                e -= optimal[t] * DT * BATTERY_CHARGE_EFF
+            e += surplus[t] * DT * BATTERY_CHARGE_EFF
+            e  = max(E_min, min(E_max, e))
 
         log.info(
-            f"LP solved ok | Slot-0={optimal[0]:+d}W | "
-            f"24h cost={total_cost:.4f} EUR | SOC end={soc_end:.0f}%"
+            f"LP solved ✓ | Slot-0={optimal[0]:+d}W | "
+            f"24h cost={total_cost:.4f} € | "
+            f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%} | "
+            f"OC_weight={OPPORTUNITY_COST_WEIGHT}"
         )
-
-        if LOG_DEBUG:
-            e = E_now
-            for t in range(N):
-                s     = schedule[t]
-                soc_t = e / BATTERY_SIZE_WH * 100.0
-                log.info(
-                    f"  {s['time'].strftime('%H:%M')} "
-                    f"price={prices[t]*100:.1f}ct "
-                    f"cons={loads[t]:.0f}W pv={solars[t]:.0f}W "
-                    f"chg_grid={p_chg_grid[t]:.0f}W "
-                    f"chg_pv={p_chg_pv[t]:.0f}W "
-                    f"dis={p_discharge[t]:.0f}W "
-                    f"grid={p_grid[t]:.0f}W "
-                    f"sp={optimal[t]:+d}W soc={soc_t:.0f}%"
-                )
-                e = e_end[t]
-
         return optimal
 
     except Exception as exc:
-        log.error(f"LP solve error: {exc} - fallback")
+        log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
+
+
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # HEURISTIC OPTIMIZER
