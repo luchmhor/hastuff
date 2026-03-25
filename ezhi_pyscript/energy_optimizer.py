@@ -441,17 +441,15 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
 # LP OPTIMIZER
 # ════════════════════════════════════════════════════════════════════════════
 
-def _solve_optimal_schedule(soc: float, schedule: list) -> list:
+def _solve_optimal_schedule(soc, schedule):
     """
-    5-variable-per-slot LP:
-      p_charge_grid[t]  W  grid → battery
-      p_charge_pv[t]    W  PV surplus → battery  (zero cost)
-      p_discharge[t]    W  battery → load
-      p_grid[t]         W  grid → load
-      e[t]              Wh battery energy at end of slot t
-
-    Objective: minimise sum_t (p_grid[t] + p_charge_grid[t]) * price[t] * DT/1000
-    No generator expressions — uses list comprehensions throughout.
+    5-variable-per-slot LP.
+    Variable layout per slot t (N slots total):
+      index t        = p_chg_grid[t]   W  grid -> battery
+      index N+t      = p_chg_pv[t]     W  PV surplus -> battery (free)
+      index 2*N+t    = p_discharge[t]  W  battery -> load
+      index 3*N+t    = p_grid[t]       W  grid -> load
+      index 4*N+t    = e[t]            Wh battery energy end of slot
     """
     N  = len(schedule)
     DT = 0.25
@@ -465,75 +463,68 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     prices = [s["price"] for s in schedule]
 
     pv_threshold = PV_NAMEPLATE_WP / 10.0
-    price_min    = min(prices)
-    price_max    = max(prices)
     price_avg    = sum(prices) / N
 
     log.info(
-        f"LP (5-var): E_now={E_now:.0f}Wh | "
-        f"price min={price_min*100:.1f} avg={price_avg*100:.1f} "
-        f"max={price_max*100:.1f} ct"
+        f"LP (5-var): E_now={E_now:.0f}Wh "
+        f"price min={min(prices)*100:.1f} avg={price_avg*100:.1f} "
+        f"max={max(prices)*100:.1f} ct"
     )
 
-    # ── Variable indices ──────────────────────────────────────────────────────
-    # Layout: [p_chg_grid(N) | p_chg_pv(N) | p_discharge(N) | p_grid(N) | e(N)]
-    def icg(t): return t
-    def icp(t): return N + t
-    def id_(t): return 2 * N + t
-    def ig_(t): return 3 * N + t
-    def ie_(t): return 4 * N + t
     NVARS = 5 * N
 
     # ── Objective ─────────────────────────────────────────────────────────────
     c_obj = [0.0] * NVARS
     for t in range(N):
-        c_obj[icg(t)] = prices[t] * DT / 1000.0
-        c_obj[ig_(t)] = prices[t] * DT / 1000.0
+        c_obj[t]       = prices[t] * DT / 1000.0   # p_chg_grid cost
+        c_obj[3*N + t] = prices[t] * DT / 1000.0   # p_grid cost
 
     # ── Bounds ────────────────────────────────────────────────────────────────
     bounds = [None] * NVARS
     for t in range(N):
-        bounds[icg(t)] = (0.0, float(abs(OUTPUT_MIN_W)))
+        bounds[t]       = (0.0, float(abs(OUTPUT_MIN_W)))
 
         pv_surplus = max(0.0, solars[t] - loads[t])
-        bounds[icp(t)] = (0.0, pv_surplus)
+        bounds[N + t]   = (0.0, pv_surplus)
 
         if solars[t] >= pv_threshold:
             max_disch = max(0.0, loads[t])
         else:
             max_disch = float(OUTPUT_MAX_W)
-        bounds[id_(t)] = (0.0, max_disch)
+        bounds[2*N + t] = (0.0, max_disch)
 
-        bounds[ig_(t)] = (0.0, None)
-        bounds[ie_(t)] = (E_min, E_max)
+        bounds[3*N + t] = (0.0, None)
+        bounds[4*N + t] = (E_min, E_max)
 
-    # ── Inequality: grid covers load shortfall ────────────────────────────────
+    # ── Inequality: p_grid covers load shortfall ──────────────────────────────
     # p_chg_grid[t] - p_discharge[t] - p_grid[t] <= solar[t] - load[t]
     A_ub = []
     b_ub = []
     for t in range(N):
         row = [0.0] * NVARS
-        row[icg(t)] =  1.0
-        row[id_(t)] = -1.0
-        row[ig_(t)] = -1.0
+        row[t]       =  1.0
+        row[2*N + t] = -1.0
+        row[3*N + t] = -1.0
         A_ub.append(row)
         b_ub.append(solars[t] - loads[t])
 
     # ── Equality: SOC dynamics ────────────────────────────────────────────────
-    # e[t] = e[t-1] + (p_chg_grid[t] + p_chg_pv[t]) * DT * CEFF
-    #               -  p_discharge[t] * DT / DEFF
-    # rearranged: -p_chg_grid*DT*CEFF - p_chg_pv*DT*CEFF + p_disch*DT/DEFF + e[t] - e[t-1] = 0
-    # for t=0: b = E_now  (e[-1] = E_now)
+    # e[t] = e[t-1]
+    #      + (p_chg_grid[t] + p_chg_pv[t]) * DT * CHARGE_EFF
+    #      -  p_discharge[t] * DT / DISCHARGE_EFF
+    # rearranged (all on lhs):
+    #   -p_chg_grid*DT*CEFF - p_chg_pv*DT*CEFF + p_disch*DT/DEFF + e[t] - e[t-1] = 0
+    #   for t=0: e[-1] = E_now, so b = E_now
     A_eq = []
     b_eq = []
     for t in range(N):
         row = [0.0] * NVARS
-        row[icg(t)] = -DT * BATTERY_CHARGE_EFF
-        row[icp(t)] = -DT * BATTERY_CHARGE_EFF
-        row[id_(t)] =  DT / BATTERY_DISCHARGE_EFF
-        row[ie_(t)] =  1.0
+        row[t]       = -DT * BATTERY_CHARGE_EFF
+        row[N + t]   = -DT * BATTERY_CHARGE_EFF
+        row[2*N + t] =  DT / BATTERY_DISCHARGE_EFF
+        row[4*N + t] =  1.0
         if t > 0:
-            row[ie_(t - 1)] = -1.0
+            row[4*N + t - 1] = -1.0
             b_eq.append(0.0)
         else:
             b_eq.append(E_now)
@@ -550,17 +541,16 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         )
 
         if result.status != 0:
-            log.warning(f"LP status {result.status}: {result.message} — fallback")
+            log.warning(f"LP status {result.status}: {result.message} - fallback")
             return _heuristic_schedule(soc, schedule)
 
-        # ── Extract solution ──────────────────────────────────────────────────
-        p_chg_grid  = [result.x[icg(t)] for t in range(N)]
-        p_chg_pv    = [result.x[icp(t)] for t in range(N)]
-        p_discharge = [result.x[id_(t)] for t in range(N)]
-        p_grid      = [result.x[ig_(t)] for t in range(N)]
-        e_end       = [result.x[ie_(t)] for t in range(N)]
+        # ── Extract ───────────────────────────────────────────────────────────
+        p_chg_grid  = [result.x[t]       for t in range(N)]
+        p_chg_pv    = [result.x[N + t]   for t in range(N)]
+        p_discharge = [result.x[2*N + t] for t in range(N)]
+        p_grid      = [result.x[3*N + t] for t in range(N)]
+        e_end       = [result.x[4*N + t] for t in range(N)]
 
-        # Inverter setpoint: positive = discharge, negative = charge
         optimal = []
         for t in range(N):
             total_charge = p_chg_grid[t] + p_chg_pv[t]
@@ -568,17 +558,15 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             net_sp = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, net_sp))
             optimal.append(net_sp)
 
-        # Total cost — list comprehension, no generator expression
-        cost_terms = [
-            (p_grid[t] + p_chg_grid[t]) * prices[t] * DT / 1000.0
-            for t in range(N)
-        ]
-        total_cost = sum(cost_terms)
-        soc_end    = e_end[-1] / BATTERY_SIZE_WH * 100.0
+        total_cost = 0.0
+        for t in range(N):
+            total_cost += (p_grid[t] + p_chg_grid[t]) * prices[t] * DT / 1000.0
+
+        soc_end = e_end[-1] / BATTERY_SIZE_WH * 100.0
 
         log.info(
-            f"LP solved ✓ | Slot-0={optimal[0]:+d}W | "
-            f"24h cost={total_cost:.4f} € | SOC end={soc_end:.0f}%"
+            f"LP solved ok | Slot-0={optimal[0]:+d}W | "
+            f"24h cost={total_cost:.4f} EUR | SOC end={soc_end:.0f}%"
         )
 
         if LOG_DEBUG:
@@ -601,7 +589,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         return optimal
 
     except Exception as exc:
-        log.error(f"LP solve error: {exc} — fallback")
+        log.error(f"LP solve error: {exc} - fallback")
         return _heuristic_schedule(soc, schedule)
 
 # ════════════════════════════════════════════════════════════════════════════
