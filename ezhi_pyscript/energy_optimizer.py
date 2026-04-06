@@ -151,6 +151,7 @@ async def _fetch_historical_consumption() -> dict:
     accum = {}
     for week_back in range(1, 5):
         anchor    = now - timedelta(weeks=week_back)
+        dow       = anchor.weekday()  # 0=Mon
         day_start = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end   = day_start + timedelta(days=1)
         s_utc = day_start.astimezone(pytz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -175,7 +176,7 @@ async def _fetch_historical_consumption() -> dict:
                 t_local = datetime.fromisoformat(
                     row[t_idx].replace("Z", "+00:00")
                 ).astimezone(TZ)
-                key = (t_local.hour, t_local.minute // 15)
+                key = (dow, t_local.hour, t_local.minute // 15)
                 accum.setdefault(key, []).append(row[mean_idx])
         except Exception as exc:
             log.warning(f"InfluxDB query error (week -{week_back}): {exc}")
@@ -199,7 +200,7 @@ def _fallback_consumption() -> dict:
         700, 700, 700, 700, 700,
         300, 300,
     ]
-    return {(h, q): hourly[h] for h in range(24) for q in range(4)}
+    return {(dow, h, q): hourly[h] for dow in range(7) for h in range(24) for q in range(4)}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -251,8 +252,8 @@ async def _get_solar_actuals() -> dict:
 def _get_solar_forecast(actuals: dict) -> dict:
     """
     Build per-hour solar estimate blending actuals with Solcast forecast.
-    Past hours   : 100 % actual
-    Current hour : 50 % actual + 50 % scaled forecast
+    Past hours         : 100 % actual
+    Current hour       : 50 % actual + 50 % scaled forecast
     Next SOLAR_BLEND_HOURS : gradually shift from scaled → pure forecast
     Beyond blend window    : pure Solcast forecast
     """
@@ -322,21 +323,25 @@ def _get_solar_forecast(actuals: dict) -> dict:
         for h in range(now.hour + 24):
             hour_of_day = h % 24
             hours_ahead = h - now.hour
+            base_fc     = forecast.get(hour_of_day, 0.0)
+
             if hours_ahead < 0:
-                solar[hour_of_day] = actuals.get(hour_of_day, forecast.get(hour_of_day, 0.0))
+                solar[hour_of_day] = actuals.get(hour_of_day, base_fc)
             elif hours_ahead == 0:
-                fc = forecast.get(hour_of_day, 0.0) * scale
+                fc = base_fc * scale
                 if hour_of_day in actuals:
                     solar[hour_of_day] = 0.5 * actuals[hour_of_day] + 0.5 * fc
                 else:
                     solar[hour_of_day] = fc
             elif hours_ahead <= SOLAR_BLEND_HOURS:
-                blend_weight = hours_ahead / SOLAR_BLEND_HOURS
-                scaled_fc    = forecast.get(hour_of_day, 0.0) * scale
-                pure_fc      = forecast.get(hour_of_day, 0.0)
-                solar[hour_of_day] = (1 - blend_weight) * scaled_fc + blend_weight * pure_fc
+                blend_weight_time = hours_ahead / SOLAR_BLEND_HOURS
+                # reduce scaling when forecast is already high (around noon)
+                noon_factor = min(1.0, base_fc / (0.7 * PV_NAMEPLATE_WP))
+                scale_local = 1.0 + (scale - 1.0) * noon_factor
+                scaled_fc   = base_fc * scale_local
+                solar[hour_of_day] = (1 - blend_weight_time) * scaled_fc + blend_weight_time * base_fc
             else:
-                solar[hour_of_day] = forecast.get(hour_of_day, 0.0)
+                solar[hour_of_day] = base_fc
 
         if solar:
             peak_hour = max(solar, key=solar.get)
@@ -407,14 +412,14 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
     now    = now.replace(minute=minute, second=0, microsecond=0)
     out    = []
     for i in range(SCHEDULE_SLOTS):
-        t   = now + timedelta(minutes=15 * i)
-        key = (t.hour, t.minute // 15)
-        c   = consumption.get(key, 300.0)
-        s   = solar.get(t.hour, 0.0)
-        p   = prices.get(key, 0.15)
+        t        = now + timedelta(minutes=15 * i)
+        cons_key = (t.weekday(), t.hour, t.minute // 15)
+        price_key= (t.hour, t.minute // 15)
+        c        = consumption.get(cons_key, 300.0)
+        s        = solar.get(t.hour, 0.0)
+        p        = prices.get(price_key, 0.15)
         out.append({"i": i, "time": t, "cons": c, "solar": s, "price": p, "net": c - s})
     return out
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # LP OPTIMIZER
@@ -428,20 +433,32 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     E_min = BATTERY_EMPTY_PCT / 100.0 * BATTERY_SIZE_WH
     E_max = BATTERY_FULL_PCT  / 100.0 * BATTERY_SIZE_WH
 
-    loads  = [s["cons"]  for s in schedule]
-    solars = [s["solar"] for s in schedule]
-    prices = [s["price"] for s in schedule]
+    loads   = [s["cons"]  for s in schedule]
+    solars  = [s["solar"] for s in schedule]
+    prices  = [s["price"] for s in schedule]
+    netload = [c - s for c, s in zip(loads, solars)]
 
-    # Free PV charge: surplus above load, capped by max charge rate.
+    # Free PV charge: surplus above net load (negative netload), capped by max charge rate.
     pv_threshold = PV_NAMEPLATE_WP / 10.0
     surplus = [
-        min(max(0.0, solars[t] - loads[t]), abs(OUTPUT_MIN_W))
-        for t in range(N)
+        min(max(0.0, -nl), abs(OUTPUT_MIN_W))
+        for nl in netload
     ]
 
     price_max = max(prices)
     price_min = min(prices)
     price_avg = sum(prices) / N
+
+    # Build a simple SOC target profile (higher before expensive hours)
+    cheap_hours = [i for i, p in enumerate(prices) if p <= price_avg]
+    peak_hours  = [i for i, p in enumerate(prices) if p >= price_max - 0.01]
+
+    soc_target = [0.6] * N
+    for i in range(N):
+        if i in peak_hours:
+            soc_target[i] = 0.80
+        elif i in cheap_hours:
+            soc_target[i] = 0.40
 
     # ── Decision variables ───────────────────────────────────────────────
     # b[t] ∈ [OUTPUT_MIN_W, max_discharge_t]  (+discharge / -charge)
@@ -449,23 +466,28 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     # Total: 2·N variables, index layout: b[0..N-1], g[N..2N-1]
 
     # ── Objective ────────────────────────────────────────────────────────
-    # Discharge cost coefficient  (b[t] > 0):
-    #   base reward      = -price[t] * eff * DT/1000
-    #   opportunity cost = +(price_max - price[t]) * eff * DT/1000 * weight
-    #     → penalises cheap discharge, incentivises saving SOC for peaks
-    #
-    # Grid-charge cost coefficient (b[t] < 0, handled via g[t] slack):
-    #   grid cost    = +price[t] * DT/1000
-    #   cheap bonus  = -max(0, price_avg - price[t]) * eff * DT/1000 * weight
-    #     → rewards opportunistic cheap charging
     c_obj = []
     for t in range(N):
         opp_cost = (price_max - prices[t]) * BATTERY_DISCHARGE_EFF * DT / 1000.0 * OPPORTUNITY_COST_WEIGHT
+
+        # Relative SOC vs target for this slot (approximate with current energy level)
+        soc_rel = (E_now - E_min) / max(1.0, E_max - E_min)
+        soc_tgt = soc_target[t]
+        want_more = soc_rel < soc_tgt
+
+        # Penalize discharge more when below target, slightly less when above
+        if want_more:
+            soc_penalty = 0.0002
+        else:
+            soc_penalty = -0.00005
+
         c_obj.append(
             -prices[t] * BATTERY_DISCHARGE_EFF * DT / 1000.0
             + opp_cost
             + DISCHARGE_PENALTY * DT / 1000.0
+            + soc_penalty
         )
+
     for t in range(N):
         cheap_bonus = max(0.0, price_avg - prices[t]) * BATTERY_CHARGE_EFF * DT / 1000.0 * OPPORTUNITY_COST_WEIGHT
         c_obj.append(prices[t] * DT / 1000.0 - cheap_bonus)
@@ -485,25 +507,21 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     A_ub = []
     b_ub = []
 
-    # 1) Grid slack: g[t] >= net_load[t] - b[t]
-    #    ↔  -b[t] - g[t] ≤ solar[t] - load[t]
+    # 1) Grid slack: g[t] >= netload[t] - b[t]
+    #    ↔  -b[t] - g[t] ≤ -netload[t]
     for t in range(N):
         row = [0.0] * (2 * N)
         row[t]     = -1.0
         row[N + t] = -1.0
         A_ub.append(row)
-        b_ub.append(solars[t] - loads[t])
+        b_ub.append(-netload[t])
 
-    # 2) SOC lower bound (no over-discharge) and
-    # 3) SOC upper bound (no over-charge), accounting for passive PV surplus.
-    #
-    # FIX 1: max() with generator + default= keyword → explicit list + slice
+    # 2) SOC lower/upper bounds, accounting for passive PV surplus.
     _pv_slots = [t for t in range(N) if solars[t] >= pv_threshold]
     last_pv_slot = _pv_slots[-1] if _pv_slots else -1
 
     soc_weight = min(1.0, (E_now - E_min) / max(1.0, E_max - E_min))
 
-    # FIX 2: sum() with generator → sum() with list comprehension
     estimated_discharge_wh = sum([
         max(0.0, loads[t]) * DT
         for t in range(N)
@@ -546,15 +564,16 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         A_ub.append(row)
         b_ub.append(max(0.0, E_max - E_now - cum_surplus_e))
 
-    # 4) No-export: battery setpoint ≤ net load when net load ≥ 0.
+    # 4) Conditional no-export: battery setpoint ≤ netload when netload ≥ 0
+    #    or price above average; allow export only at very low prices.
     if not ALLOW_EXPORT:
         for t in range(N):
-            net = loads[t] - solars[t]
-            if net >= 0:
+            nl = netload[t]
+            if nl >= 0 or prices[t] >= price_avg:
                 row = [0.0] * (2 * N)
                 row[t] = 1.0
                 A_ub.append(row)
-                b_ub.append(net)
+                b_ub.append(nl)
 
     # ── Solve ────────────────────────────────────────────────────────────
     try:
@@ -581,7 +600,9 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         total_cost = 0.0
         e = E_now
         for t in range(N):
-            grid_w = loads[t] - solars[t] - optimal[t]
+            grid_w = netload[t] - optimal[t]
+            if not ALLOW_EXPORT:
+                grid_w = max(0.0, grid_w)
             if grid_w > 0:
                 total_cost += grid_w * prices[t] * DT / 1000.0
             if optimal[t] > 0:
