@@ -493,15 +493,30 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         c_obj.append(prices[t] * DT / 1000.0 - cheap_bonus)
 
     # ── Bounds ───────────────────────────────────────────────────────────
+        # ── Bounds ───────────────────────────────────────────────────
     bounds = []
     for t in range(N):
         if solars[t] >= pv_threshold:
-            max_disch = max(0.0, loads[t])   # PV active: don't discharge > load
+            max_disch = max(0.0, loads[t])
         else:
             max_disch = float(OUTPUT_MAX_W)
-        bounds.append((float(OUTPUT_MIN_W), max_disch))
+
+        # Restrict grid-charging based on current SOC.
+        # Above 70%: PV will cover remaining headroom → no grid charging.
+        # 50–70%: only allow charging during genuinely cheap slots.
+        if soc >= 70:
+            min_sp = 0.0
+        elif soc >= 50:
+            p25 = ctx.get('p25', 0.10)
+            price_t = prices[t]
+            min_sp = float(OUTPUT_MIN_W) if price_t <= p25 else 0.0
+        else:
+            min_sp = float(OUTPUT_MIN_W)   # low SOC: full grid-charge allowed
+
+        bounds.append((min_sp, max_disch))
+
     for t in range(N):
-        bounds.append((0.0, None))            # g[t] >= 0
+        bounds.append((0.0, None))
 
     # ── Inequality constraints  A_ub · x ≤ b_ub ─────────────────────────
     A_ub = []
@@ -723,23 +738,35 @@ def _mode_from_setpoint(sp: int) -> str:
     return "BALANCE"
 
 
-def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tuple:
-    p75 = _ctx.get("p75", 0.20)
+def apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tuple:
+    p75 = ctx.get('p75', 0.20)
 
-    if price >= p75:
-        return (_mode_from_setpoint(sp), sp)
+    # ── NEW: suppress grid-charging when battery is already well-charged.
+    # The LP optimises over historical averages and ignores that PV will
+    # fill the remaining headroom for free.  Grid-charging above 70% SOC
+    # just wastes round-trip losses (≈10%).
+    # Exception: allow it only when price is in the cheapest 10% AND
+    # remaining headroom is large (soc < 50%).
+    if sp < -GRID_DEAD_ZONE_W:          # LP wants to grid-charge
+        if soc >= 70:                    # battery already well charged
+            sp = 0                       # suppress → grid-neutral
+            return BALANCE, 0
+        p25 = ctx.get('p25', 0.10)
+        if soc >= 50 and price > p25:    # medium SOC but not super-cheap
+            sp = 0
+            return BALANCE, 0
 
+    if price > p75:
+        return mode_from_setpoint(sp), sp
     if soc >= BATTERY_FULL_PCT:
-        if sp > GRID_DEADZONE_W:
-            return (_mode_from_setpoint(sp), sp)
-        return ("TRICKLE", 0)
-
+        if sp > GRID_DEAD_ZONE_W:
+            return mode_from_setpoint(sp), sp
+        return TRICKLE, 0
     if soc >= BATTERY_TRICKLE_PCT:
-        if net < -GRID_DEADZONE_W:
-            return ("BALANCE", 0)
-        return ("TRICKLE", -BATTERY_TRICKLE_W)
-
-    return (_mode_from_setpoint(sp), sp)
+        if net < -GRID_DEAD_ZONE_W:
+            return BALANCE, 0
+        return TRICKLE, -BATTERY_TRICKLE_W
+    return mode_from_setpoint(sp), sp
 
 
 # ════════════════════════════════════════════════════════════════════════════
