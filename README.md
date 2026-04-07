@@ -333,12 +333,13 @@ All heavy lifting (data fetching, optimization, output) resides in the imported 
 1. **Copy the files** into your pyscript folder, e.g., `/config/pyscript/`.
 
 /config/pyscript/
-├─ energy_optimizer_config.yaml
-├─ _config.py
-├─ data_fetcher.py
-├─ optimizer.py
-├─ output_handler.py
-└─ main.py
+└─ energy_optimizer/
+     ├─ __init__.py
+     ├─ _config.py
+     ├─ data_fetcher.py
+     ├─ optimizer.py
+     ├─ output_handler.py
+     └─ main.py
 
 2. **Adjust the YAML** if needed (battery size, efficiencies, timezone, file paths, etc.).  
 3. **Reload the pyscript** in Home Assistant: *Developer Tools → YAML → `pyscript: reload`* or restart Home Assistant.  
