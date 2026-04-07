@@ -1,8 +1,7 @@
 alias: Energy Optimizer — Tactical Control
 description: >
-  Adjusts inverter output every 5 seconds based on optimizer mode and live grid
-  power from shrdzm sensor. Strategic setpoints are used as targets only; all
-  modes use closed-loop shrdzm feedback.
+  Adjusts inverter every 5 seconds. All modes use closed-loop grid_w feedback.
+  strategic_sp is a target direction only, never applied directly.
 
 triggers:
   - trigger: time_pattern
@@ -12,91 +11,106 @@ conditions: []
 
 actions:
   - variables:
-      # Raw states
-      _mode_id_raw: "{{ states('input_number.energy_optimizer_mode_id') }}"
-      _strategic_sp_raw: "{{ states('input_number.energy_optimizer_setpoint') }}"
-      _grid_w_raw: "{{ states('sensor.shrdzm_485519e15aae_16_7_0') }}"
-      _current_sp_raw: "{{ states('number.apsystems_ezhi_max_output_power') }}"
-      _soc_raw: "{{ states('sensor.ezhi_battery_state_of_charge') }}"
-      _batt_w_raw: "{{ states('sensor.ezhi_battery_power') }}"
-
-      # Robust parsing with defaults
-      mode_id: >-
-        {% set v = _mode_id_raw | float(0) %}
-        {{ v | int(0) }}
-
-      strategic_sp: >-
-        {% set v = _strategic_sp_raw | float(0) %}
-        {{ [1200, [-1200, v] | max] | min }}
-
-      grid_w: >-
-        {% set v = _grid_w_raw | float('nan') %}
-        {% if v != v %}
-          0
-        {% else %}
-          {{ v | round(0) }}
-        {% endif %}
-
-      current_sp: >-
-        {% set v = _current_sp_raw | float(0) %}
-        {{ [1200, [-1200, v] | max] | min }}
-
-      soc: >-
-        {% set v = _soc_raw | float('nan') %}
-        {% if v != v %}
-          50
-        {% else %}
-          {{ [100, [0, v] | max] | min }}
-        {% endif %}
-
-      batt_w: >-
-        {% set v = _batt_w_raw | float('nan') %}
-        {% if v != v %}
-          0
-        {% else %}
-          {{ v | round(0) }}
-        {% endif %}
+      mode_id:      "{{ states('input_number.energy_optimizer_mode_id') | int(0) }}"
+      strategic_sp: "{{ states('input_number.energy_optimizer_setpoint') | float(0) | int }}"
+      grid_w:       "{{ states('sensor.shrdzm_485519e15aae_16_7_0') | float(0) | round(0) | int }}"
+      current_sp:   "{{ states('number.apsystems_ezhi_max_output_power') | float(0) | round(0) | int }}"
+      soc:          "{{ states('sensor.ezhi_battery_state_of_charge') | float(50) }}"
+      batt_w:       "{{ states('sensor.ezhi_battery_power') | float(0) }}"
 
   - choose:
-      # ─────────────────────────────────────────────────────────────
-      # HARD SOC PROTECTION (SOC <= 20%): force zero discharge
+
+      # ── 1. GRID_CHARGE (mode 1) ──────────────────────────────────
+      # strategic_sp is a TARGET direction, not a direct command.
+      # Uses closed-loop grid_w feedback to step towards it.
+      # Hard exits if battery is full or not accepting charge.
       # ─────────────────────────────────────────────────────────────
       - conditions:
           - condition: template
-            value_template: "{{ soc <= 20 and current_sp > 0 }}"
+            value_template: "{{ mode_id == 1 }}"
         sequence:
+          - choose:
+              # Battery full or not accepting charge → stop immediately
+              - conditions:
+                  - condition: template
+                    value_template: "{{ soc >= 98 or (batt_w == 0 and current_sp < 0) }}"
+                sequence:
+                  - action: number.set_value
+                    target:
+                      entity_id: number.apsystems_ezhi_max_output_power
+                    data:
+                      value: 0
+
+              # Step towards strategic_sp using grid_w feedback:
+              # grid_w > deadband  → importing too much → charge harder (more negative)
+              # grid_w < -deadband → exporting         → charge softer (less negative)
+              # grid_w in deadband → hold position
+              - conditions:
+                  - condition: template
+                    value_template: "{{ true }}"
+                sequence:
+                  - variables:
+                      deadband: 30
+                      step: >-
+                        {% set err = grid_w | abs %}
+                        {% if err > 300 %}100
+                        {% elif err > 150 %}50
+                        {% elif err > 75 %}30
+                        {% elif err > 30 %}20
+                        {% else %}0{% endif %}
+                      new_sp: >-
+                        {% if grid_w > deadband %}
+                          {{ [strategic_sp, current_sp - step] | max }}
+                        {% elif grid_w < -deadband %}
+                          {{ [0, current_sp + step] | min }}
+                        {% else %}
+                          {{ current_sp }}
+                        {% endif %}
+                  - condition: template
+                    value_template: "{{ (new_sp - current_sp) | abs >= 10 }}"
+                  - action: number.set_value
+                    target:
+                      entity_id: number.apsystems_ezhi_max_output_power
+                    data:
+                      value: "{{ new_sp }}"
+
+      # ── 2. STALE NEGATIVE GUARD ──────────────────────────────────
+      # If inverter is negative but we are NOT in mode 1, zero it
+      # immediately. Catches any value left over from a previous
+      # GRID_CHARGE cycle before any other branch sees it.
+      # ─────────────────────────────────────────────────────────────
+      - conditions:
           - condition: template
-            value_template: "{{ (current_sp - 0) | abs >= 20 }}"
+            value_template: "{{ current_sp < 0 }}"
+        sequence:
           - action: number.set_value
             target:
               entity_id: number.apsystems_ezhi_max_output_power
             data:
               value: 0
 
-      # ─────────────────────────────────────────────────────────────
-      # GRID_CHARGE (mode 1): follow strategic setpoint directly
+      # ── 3. SOC PROTECTION ────────────────────────────────────────
+      # Battery nearly empty: stop discharging immediately.
       # ─────────────────────────────────────────────────────────────
       - conditions:
           - condition: template
-            value_template: "{{ mode_id == 1 }}"
+            value_template: "{{ soc <= 20 and current_sp > 0 }}"
         sequence:
-          - condition: template
-            value_template: "{{ (strategic_sp - current_sp) | abs >= 10 }}"
           - action: number.set_value
             target:
               entity_id: number.apsystems_ezhi_max_output_power
             data:
-              value: "{{ strategic_sp | int }}"
+              value: 0
 
-      # ─────────────────────────────────────────────────────────────
-      # TRICKLE (mode 3): narrow, smoother hysteresis
+      # ── 4. TRICKLE (mode 3) ──────────────────────────────────────
+      # Hold SOC in 96–98% band by slowly modulating output.
       # ─────────────────────────────────────────────────────────────
       - conditions:
           - condition: template
             value_template: "{{ mode_id == 3 }}"
         sequence:
           - choose:
-              # Battery full and still charging: allow gentle export relief
+              # Full and still absorbing charge → raise output to relieve battery
               - conditions:
                   - condition: template
                     value_template: "{{ soc >= 98 and batt_w > 0 }}"
@@ -107,7 +121,7 @@ actions:
                     data:
                       value: "{{ [1200, current_sp + 10] | min }}"
 
-              # Battery below trickle band: allow slow recharge from PV/grid
+              # Below trickle band → lower output to let battery recharge
               - conditions:
                   - condition: template
                     value_template: "{{ soc < 96 }}"
@@ -116,36 +130,38 @@ actions:
                     target:
                       entity_id: number.apsystems_ezhi_max_output_power
                     data:
-                      value: "{{ [-1200, current_sp - 10] | max }}"
+                      value: "{{ [0, current_sp - 10] | max }}"
 
-              # Within trickle band: smoothly move towards 0 W
+              # In trickle band (96–98%) → creep towards 0
               - conditions:
                   - condition: template
                     value_template: "{{ soc >= 96 and soc < 98 }}"
                 sequence:
                   - variables:
-                      new_sp: >-
-                        {% set s = current_sp | float(0) %}
-                        {% if s > 0 %}
-                          {{ max(0, s - 10) }}
-                        {% elif s < 0 %}
-                          {{ min(0, s + 10) }}
+                      trickle_sp: >-
+                        {% if current_sp > 0 %}
+                          {{ [0, current_sp - 10] | max }}
                         {% else %}
                           0
                         {% endif %}
                   - condition: template
-                    value_template: "{{ (new_sp - current_sp) | abs >= 10 }}"
+                    value_template: "{{ (trickle_sp - current_sp) | abs >= 10 }}"
                   - action: number.set_value
                     target:
                       entity_id: number.apsystems_ezhi_max_output_power
                     data:
-                      value: "{{ new_sp | int }}"
+                      value: "{{ trickle_sp }}"
 
-      # ─────────────────────────────────────────────────────────────
-      # BALANCE (0) + DISCHARGE (2): closed-loop grid control
-      #   - use grid_w feedback
-      #   - honour strategic_sp as bias in DISCHARGE mode
-      #   - prevent charging from grid unless SOC is very high
+      # ── 5. BALANCE (0) + DISCHARGE (2) ───────────────────────────
+      # Incremental closed-loop grid tracking.
+      # Step UP   when importing  (grid_w > +deadband)
+      # Step DOWN when exporting  (grid_w < -deadband)
+      # Hold      when in deadband (already balanced)
+      #
+      # Step size scales with error magnitude for fast convergence
+      # from far away and precision near zero.
+      # current_sp is guaranteed >= 0 here: branch 2 clears any
+      # negative value before this branch is ever reached.
       # ─────────────────────────────────────────────────────────────
       - conditions:
           - condition: template
@@ -153,56 +169,23 @@ actions:
         sequence:
           - variables:
               deadband: 30
-
-              # SOC-aware gain: lower gain at very low SOC
-              gain: >-
-                {% if soc <= 25 %}
-                  0.3
-                {% elif soc <= 40 %}
-                  0.4
-                {% else %}
-                  0.5
-                {% endif %}
-
-              # Simple proportional reaction on grid power
-              raw_delta: |
-                {% if grid_w | abs > deadband %}
-                  {{ (gain * grid_w) | round(0) | int }}
-                {% else %}
-                  0
-                {% endif %}
-
-              # Quantise in 20 W steps to avoid chatter
-              delta: "{{ ((raw_delta / 20) | round(0) | int) * 20 }}"
-
-              proposed_sp: "{{ current_sp + delta }}"
-
+              step: >-
+                {% set err = grid_w | abs %}
+                {% if err > 300 %}100
+                {% elif err > 150 %}50
+                {% elif err > 75 %}30
+                {% elif err > 30 %}20
+                {% else %}0{% endif %}
               new_sp: >-
-                {% set s = proposed_sp | float(0) %}
-
-                {# Hard inverter limits #}
-                {% set s = [s,  1200] | min %}
-                {% set s = [s, -1200] | max %}
-
-                {# In DISCHARGE mode honour LP floor even if grid_w slightly importing #}
-                {% if mode_id == 2 %}
-                  {% set s = [s, strategic_sp] | max %}
+                {% if grid_w > deadband %}
+                  {{ [1200, current_sp + step] | min }}
+                {% elif grid_w < -deadband %}
+                  {{ [0, current_sp - step] | max }}
+                {% else %}
+                  {{ current_sp }}
                 {% endif %}
-
-                {# No active charging from grid unless SOC is very high #}
-                {% if s < 0 and soc < 95 %}
-                  {% set s = 0 %}
-                {% endif %}
-
-                {# Hard export guard: never allow setpoint to increase while exporting #}
-                {% if grid_w < -30 %}
-                  {% set s = [s, current_sp] | min %}
-                {% endif %}
-
-                {{ s | int }}
-
           - condition: template
-            value_template: "{{ (new_sp - current_sp) | abs >= 20 }}"
+            value_template: "{{ (new_sp - current_sp) | abs >= 10 }}"
           - action: number.set_value
             target:
               entity_id: number.apsystems_ezhi_max_output_power
