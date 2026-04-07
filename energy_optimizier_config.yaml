@@ -1,0 +1,65 @@
+# energy_optimizer_config.yaml
+# All values that are likely to change per‑installation go here.
+# Edit this file and restart the pyscript (or reload the module) to apply new values.
+
+general:
+  timezone: Europe/Vienna          # IANA timezone name
+  use_lp_optimizer: true           # set false to force heuristic fallback
+  log_debug: true                  # verbose logging to Home Assistant log
+
+influx:
+  url: http://localhost:8086/query
+  write_url: http://localhost:8086/write
+  database: homeassistant
+  username: homeassistant
+  password: hainflux!
+  unit: W                          # the unit stored in InfluxDB
+  entity_consumption: total_consumption
+  entity_pv: ezhi_photovoltaic_power
+  entity_soc: sensor.ezhi_battery_state_of_charge
+  price_sensor: sensor.epex_spot_data_total_price
+
+solcast:
+  # These entity IDs are read from Home Assistant state; only the names are needed here.
+  hour: sensor.solcast_pv_forecast_forecast_next_hour
+  today: sensor.solcast_pv_forecast_forecast_today
+  tomorrow: sensor.solcast_pv_forecast_forecast_tomorrow
+
+files:
+  outlook_md: /config/www/energy_outlook.md
+  forecast_csv: /config/www/energy_forecast.csv
+
+battery:
+  size_wh: 2760                     # usable capacity in Wh
+  charge_efficiency: 0.95           # fraction of input energy stored
+  discharge_efficiency: 0.95        # fraction of stored energy delivered
+  output_min_w: -1200               # max charge (negative)
+  output_max_w: 1200                # max discharge (positive)
+  full_pct: 98                      # SOC considered “full”
+  trickle_pct: 96                   # start of trickle‑band
+  empty_pct: 15                     # SOC considered “empty”
+  grid_deadzone_w: 10               # |setpoint| below this is treated as 0 W
+  trickle_w: 10                     # small charge power used in trickle‑band
+
+grid:
+  network_fee_ct_per_kwh: 10.5      # additional cost per kWh (ct)
+  allow_export: false               # set true if you want to permit export to grid
+
+solar:
+  pv_nameplate_wp: 1200             # name‑plate peak power of the PV array (Wp)
+  pv_threshold_w: 120               # treated as “producing” when ≥ this value (W)
+
+optimization:
+  schedule_slots: 96                # number of 15‑min slots in the horizon (96 = 24 h)
+  discharge_penalty: 0.0001         # small cost added to discharging in LP objective
+  opportunity_cost_weight: 0.5      # 0‑1 weight for look‑ahead term in LP
+  grid_charge_soc_block_pct: 70     # above this SOC grid‑charging is blocked
+  grid_charge_soc_cheap_pct: 50     # between cheap‑pct and block‑pct only allow at p25 price or cheaper
+
+pricing:
+  # These are only used as fall‑backs if the EPEX sensor fails; they can be left as‑is.
+  fallback_hourly_ct:
+    0: 8.0,  1: 7.5,  2: 7.0,  3: 6.5,  4: 6.5,  5: 7.0
+    6: 18.0, 7: 22.0,  8: 20.0,  9: 15.0, 10: 11.0, 11: 8.0
+    12: 6.0, 13: 6.0, 14: 7.0, 15: 9.0, 16: 14.0, 17: 22.0
+    18: 26.0,19: 28.0, 20: 24.0, 21: 18.0, 22: 13.0, 23: 10.0
