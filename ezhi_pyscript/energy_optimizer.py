@@ -726,7 +726,8 @@ def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tu
     Post-process the LP/heuristic setpoint with real-time SOC guards.
 
     Override hierarchy (highest priority first):
-    1. Battery full (≥ BATTERY_FULL_PCT): never charge, trickle if not discharging
+    1. Battery full (≥ BATTERY_FULL_PCT): discharge at PV surplus rate to prevent
+       inverter curtailment; block all charging
     2. Battery in trickle band (≥ BATTERY_TRICKLE_PCT): gentle recharge only
     3. SOC above GRID_CHARGE_SOC_BLOCK_PCT: suppress any grid-charging
     4. SOC 50–70% and not cheapest price: suppress grid-charging
@@ -735,11 +736,24 @@ def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tu
     p75 = _ctx.get("p75", 0.20)
     p25 = _ctx.get("p25", 0.10)
 
-    # Guard 1: battery full — stop all charging regardless of price or LP plan
+    # Guard 1: battery full — prevent inverter from curtailing PV.
+    # The inverter curtails PV when battery is full AND there is no active output
+    # path towards the apartment. By discharging at exactly the PV surplus rate,
+    # the inverter sees an active output path and keeps PV flowing.
+    # The surplus PV then re-charges the battery → net SOC change ≈ 0, grid = 0.
     if soc >= BATTERY_FULL_PCT:
+        pv_surplus = max(0.0, -net)   # net = cons - solar → surplus = solar - cons = -net
+        if pv_surplus > GRID_DEADZONE_W:
+            sp_anti_curtail = min(int(round(pv_surplus / 10) * 10), OUTPUT_MAX_W)
+            log.info(
+                f"Anti-curtail discharge: PV surplus={pv_surplus:.0f}W "
+                f"→ setpoint={sp_anti_curtail:+d}W (SOC {soc:.0f}%)"
+            )
+            return ("DISCHARGE", sp_anti_curtail)
+        # No surplus (consumption ≥ PV): honour LP discharge if present, else idle
         if sp > GRID_DEADZONE_W:
-            return (_mode_from_setpoint(sp), sp)   # discharge plan: honour it
-        return ("TRICKLE", 0)                        # charging or idle: hold at 0
+            return (_mode_from_setpoint(sp), sp)
+        return ("TRICKLE", 0)
 
     # Guard 2: trickle band
     if soc >= BATTERY_TRICKLE_PCT:
@@ -764,7 +778,6 @@ def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tu
         return (_mode_from_setpoint(sp), sp)
 
     return (_mode_from_setpoint(sp), sp)
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # HA OUTPUT HELPERS
