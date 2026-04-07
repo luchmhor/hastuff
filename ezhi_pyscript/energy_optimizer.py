@@ -741,31 +741,28 @@ def _mode_from_setpoint(sp: int) -> str:
 def apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tuple:
     p75 = ctx.get('p75', 0.20)
 
-    # ── NEW: suppress grid-charging when battery is already well-charged.
-    # The LP optimises over historical averages and ignores that PV will
-    # fill the remaining headroom for free.  Grid-charging above 70% SOC
-    # just wastes round-trip losses (≈10%).
-    # Exception: allow it only when price is in the cheapest 10% AND
-    # remaining headroom is large (soc < 50%).
-    if sp < -GRID_DEAD_ZONE_W:          # LP wants to grid-charge
-        if soc >= 70:                    # battery already well charged
-            sp = 0                       # suppress → grid-neutral
+    # Hard block: never grid-charge when SOC is high
+    if sp < -GRID_DEAD_ZONE_W:
+        if soc >= 70:
             return BALANCE, 0
         p25 = ctx.get('p25', 0.10)
-        if soc >= 50 and price > p25:    # medium SOC but not super-cheap
-            sp = 0
+        if soc >= 50 and price > p25:
             return BALANCE, 0
 
     if price > p75:
         return mode_from_setpoint(sp), sp
+
+    # Battery full: regardless of sp sign, never charge
     if soc >= BATTERY_FULL_PCT:
         if sp > GRID_DEAD_ZONE_W:
             return mode_from_setpoint(sp), sp
-        return TRICKLE, 0
+        return TRICKLE, 0  # covers sp<=0 AND sp==0
+
     if soc >= BATTERY_TRICKLE_PCT:
         if net < -GRID_DEAD_ZONE_W:
             return BALANCE, 0
         return TRICKLE, -BATTERY_TRICKLE_W
+
     return mode_from_setpoint(sp), sp
 
 
