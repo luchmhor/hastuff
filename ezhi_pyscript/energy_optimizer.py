@@ -76,7 +76,7 @@ NETWORK_FEE_CT_PER_KWH = 10.5
 SCHEDULE_SLOTS          = 96   # 15-min slots per planning horizon (96 = 24 h)
 
 DISCHARGE_PENALTY       = 0.0001
-OPPORTUNITY_COST_WEIGHT = 0.5  # 0.0 = disabled  0.5 = balanced  1.0 = conservative
+OPPORTUNITY_COST_WEIGHT = 0.5  # base weight for look-ahead term
 
 ALLOW_EXPORT = False
 
@@ -183,9 +183,14 @@ async def _fetch_historical_consumption() -> dict:
         log.warning("No InfluxDB data — using fallback consumption profile")
         return _fallback_consumption()
 
+    # High-side estimate: 75th percentile per 15-min slot
     result = {}
-    for k, v in accum.items():
-        result[k] = sum(v) / len(v)
+    for k, values in accum.items():
+        if not values:
+            continue
+        sorted_vals = sorted(values)
+        idx = max(0, min(len(sorted_vals) - 1, int(0.75 * (len(sorted_vals) - 1))))
+        result[k] = sorted_vals[idx]
     return result
 
 
@@ -199,7 +204,6 @@ def _fallback_consumption() -> dict:
         300, 300,
     ]
     return {(h, q): hourly[h] for h in range(24) for q in range(4)}
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # PV ACTUALS (InfluxDB)
@@ -241,7 +245,6 @@ async def _get_solar_actuals() -> dict:
     except Exception as exc:
         log.warning(f"PV actuals fetch error: {exc}")
     return actuals
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # SOLAR FORECAST (Solcast + actuals blend)
@@ -357,7 +360,6 @@ def _get_solar_forecast(actuals: dict) -> dict:
         log.warning(f"Solar scalar fallback error: {exc}")
     return solar
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # SPOT PRICES + SCHEDULE
 # ════════════════════════════════════════════════════════════════════════════
@@ -374,7 +376,6 @@ def _fallback_prices() -> dict:
         for h, ct in hourly_ct.items()
         for q in range(4)
     }
-
 
 def _get_spot_prices() -> dict:
     prices = {}
@@ -414,7 +415,6 @@ def _build_schedule(consumption: dict, solar: dict, prices: dict) -> list:
         out.append({"i": i, "time": t, "cons": c, "solar": s, "price": p, "net": c - s})
     return out
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # LP OPTIMIZER
 # ════════════════════════════════════════════════════════════════════════════
@@ -441,8 +441,20 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     price_min = min(prices)
     price_avg = sum(prices) / N
 
+    # Peak-sensitivity: how concentrated is price × load?
+    cost_intensity  = [prices[t] * max(0.0, loads[t]) for t in range(N)]
+    total_intensity = sum(cost_intensity) or 1.0
+    sorted_intensity = sorted(cost_intensity, reverse=True)
+    top_k = max(1, int(0.20 * N))
+    frac_hotspots = sum(sorted_intensity[:top_k]) / total_intensity
+    oc_scale = 0.5 + frac_hotspots      # ~0.5–1.5
+    effective_oc_weight = OPPORTUNITY_COST_WEIGHT * oc_scale
+
+    # Price quantile: lowest 20% for "no discharge" rule
+    prices_sorted = sorted(prices)
+    p20 = prices_sorted[max(0, int(0.20 * N) - 1)]
+
     # ── PV surplus look-ahead ────────────────────────────────────────────
-    # Total free PV energy (Wh) expected to arrive over the planning window
     expected_pv_surplus_wh = sum([
         min(max(0.0, solars[t] - loads[t]), abs(OUTPUT_MIN_W)) * DT * BATTERY_CHARGE_EFF
         for t in range(N)
@@ -460,21 +472,27 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     # ── Objective ────────────────────────────────────────────────────────
     c_obj = []
     for t in range(N):
-        opp_cost = (price_max - prices[t]) * BATTERY_DISCHARGE_EFF * DT / 1000.0 * OPPORTUNITY_COST_WEIGHT
+        opp_cost = (
+            (price_max - prices[t])
+            * BATTERY_DISCHARGE_EFF
+            * DT / 1000.0
+            * effective_oc_weight
+        )
         c_obj.append(
             -prices[t] * BATTERY_DISCHARGE_EFF * DT / 1000.0
             + opp_cost
             + DISCHARGE_PENALTY * DT / 1000.0
         )
     for t in range(N):
-        # Scale cheap_bonus to zero when PV will fill the battery anyway.
-        # Grid-charging only makes economic sense when PV cannot cover remaining headroom.
-        pv_headroom_ratio = min(1.0, pv_adjusted_headroom / max(1.0, BATTERY_SIZE_WH * 0.3))
+        pv_headroom_ratio = min(
+            1.0,
+            pv_adjusted_headroom / max(1.0, BATTERY_SIZE_WH * 0.3),
+        )
         cheap_bonus = (
             max(0.0, price_avg - prices[t])
             * BATTERY_CHARGE_EFF
             * DT / 1000.0
-            * OPPORTUNITY_COST_WEIGHT
+            * effective_oc_weight
             * pv_headroom_ratio
         )
         c_obj.append(prices[t] * DT / 1000.0 - cheap_bonus)
@@ -483,19 +501,19 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
     p25 = _ctx.get("p25", 0.10)
     bounds = []
     for t in range(N):
-        # When battery is full AND PV is producing, allow full output
-        # so PV is not curtailed — this prevents LP infeasibility.
+        # Discharge upper bound
         if soc >= BATTERY_FULL_PCT and solars[t] >= pv_threshold:
             max_disch = float(OUTPUT_MAX_W)
         elif solars[t] >= pv_threshold:
-            max_disch = max(0.0, loads[t])   # PV active: don't discharge > load
+            max_disch = max(0.0, loads[t])
         else:
             max_disch = float(OUTPUT_MAX_W)
 
-        # Block grid-charging based on SOC:
-        # Above GRID_CHARGE_SOC_BLOCK_PCT: PV will fill remaining headroom → no grid charge
-        # Between GRID_CHARGE_SOC_CHEAP_PCT and block: only allow at p25 (cheapest 25%) prices
-        # Below GRID_CHARGE_SOC_CHEAP_PCT: full grid charge allowed
+        # General rule: do not discharge in the very cheapest 20% of price slots
+        if prices[t] <= p20:
+            max_disch = 0.0
+
+        # Charge lower bound (negative)
         if soc >= GRID_CHARGE_SOC_BLOCK_PCT or pv_will_fill_battery:
             min_sp = 0.0
         elif soc >= GRID_CHARGE_SOC_CHEAP_PCT:
@@ -544,7 +562,7 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
         f"price_min={price_min * 100:.1f} "
         f"price_avg={price_avg * 100:.1f} "
         f"price_max={price_max * 100:.1f} ct | "
-        f"OC_weight={OPPORTUNITY_COST_WEIGHT}"
+        f"OC_weight={effective_oc_weight}"
     )
 
     cum_surplus_e = 0.0
@@ -584,10 +602,14 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
 
         optimal = []
         e = E_now
+        total_cost = 0.0
         for t in range(N):
             sp = int(round(result.x[t] / 10) * 10)
             sp = max(OUTPUT_MIN_W, min(OUTPUT_MAX_W, sp))
             optimal.append(sp)
+            grid_w = loads[t] - solars[t] - sp
+            if grid_w > 0:
+                total_cost += grid_w * prices[t] * DT / 1000.0
             if sp > 0:
                 e -= sp * DT / BATTERY_DISCHARGE_EFF
             else:
@@ -595,31 +617,17 @@ def _solve_optimal_schedule(soc: float, schedule: list) -> list:
             e += surplus[t] * DT * BATTERY_CHARGE_EFF
             e  = max(E_min, min(E_max, e))
 
-        total_cost = 0.0
-        e = E_now
-        for t in range(N):
-            grid_w = loads[t] - solars[t] - optimal[t]
-            if grid_w > 0:
-                total_cost += grid_w * prices[t] * DT / 1000.0
-            if optimal[t] > 0:
-                e -= optimal[t] * DT / BATTERY_DISCHARGE_EFF
-            else:
-                e -= optimal[t] * DT * BATTERY_CHARGE_EFF
-            e += surplus[t] * DT * BATTERY_CHARGE_EFF
-            e  = max(E_min, min(E_max, e))
-
         log.info(
             f"LP solved ✓ | Slot-0={optimal[0]:+d}W | "
             f"24h cost={total_cost:.4f} € | "
             f"RTE={BATTERY_CHARGE_EFF * BATTERY_DISCHARGE_EFF:.0%} | "
-            f"OC_weight={OPPORTUNITY_COST_WEIGHT}"
+            f"OC_weight={effective_oc_weight}"
         )
         return optimal
 
     except Exception as exc:
         log.error(f"LP solve error: {exc} — fallback")
         return _heuristic_schedule(soc, schedule)
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # HEURISTIC OPTIMIZER  (fallback when LP is disabled or fails)
@@ -653,6 +661,7 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
     n   = len(prices_sorted)
     p25 = prices_sorted[max(0, int(n * 0.25) - 1)]
     p75 = prices_sorted[min(n - 1, int(n * 0.75))]
+    p20 = prices_sorted[max(0, int(n * 0.20) - 1)]
 
     _ctx["p25"] = p25
     _ctx["p75"] = p75
@@ -674,12 +683,15 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
         net      = s["net"]
         net_load = max(0, int(net))
 
-        if soc <= BATTERY_EMPTY_PCT:
+        # Never discharge in the cheapest 20% price slots
+        if price <= p20 and net > 0:
+            sp = 0
+
+        elif soc <= BATTERY_EMPTY_PCT:
             sp = OUTPUT_MIN_W if price <= p25 else 0
         elif price >= p75:
             sp = min(OUTPUT_MAX_W, max(0, int(net)))
         elif price <= p25:
-            # Only grid-charge when SOC has meaningful headroom below block threshold
             if soc < GRID_CHARGE_SOC_BLOCK_PCT:
                 sp = OUTPUT_MIN_W
             else:
@@ -699,7 +711,6 @@ def _heuristic_schedule(soc: float, schedule: list) -> list:
         result.append(sp)
 
     return result
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # SCHEDULE DISPATCHER + MODE HELPERS
@@ -724,30 +735,28 @@ def _mode_from_setpoint(sp: int) -> str:
 def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tuple:
     """
     Post-process the LP/heuristic setpoint with real-time SOC guards.
-
-    Override hierarchy (highest priority first):
-    1. Battery full (≥ BATTERY_FULL_PCT): never charge, trickle if not discharging
-    2. Battery in trickle band (≥ BATTERY_TRICKLE_PCT): gentle recharge only
-    3. SOC above GRID_CHARGE_SOC_BLOCK_PCT: suppress any grid-charging
-    4. SOC 50–70% and not cheapest price: suppress grid-charging
-    5. Price in top 25%: honour LP discharge plan unrestricted
     """
     p75 = _ctx.get("p75", 0.20)
     p25 = _ctx.get("p25", 0.10)
 
-    # Guard 1: battery full — stop all charging regardless of price or LP plan
     if soc >= BATTERY_FULL_PCT:
+        pv_surplus = max(0.0, -net)
+        if pv_surplus > GRID_DEADZONE_W:
+            sp_anti_curtail = min(int(round(pv_surplus / 10) * 10), OUTPUT_MAX_W)
+            log.info(
+                f"Anti-curtail discharge: PV surplus={pv_surplus:.0f}W "
+                f"→ setpoint={sp_anti_curtail:+d}W (SOC {soc:.0f}%)"
+            )
+            return ("DISCHARGE", sp_anti_curtail)
         if sp > GRID_DEADZONE_W:
-            return (_mode_from_setpoint(sp), sp)   # discharge plan: honour it
-        return ("TRICKLE", 0)                        # charging or idle: hold at 0
+            return (_mode_from_setpoint(sp), sp)
+        return ("TRICKLE", 0)
 
-    # Guard 2: trickle band
     if soc >= BATTERY_TRICKLE_PCT:
         if net < -GRID_DEADZONE_W:
             return ("BALANCE", 0)
         return ("TRICKLE", -BATTERY_TRICKLE_W)
 
-    # Guard 3+4: suppress grid-charging at high SOC
     if sp < -GRID_DEADZONE_W:
         if soc >= GRID_CHARGE_SOC_BLOCK_PCT:
             log.info(f"Grid-charge suppressed: SOC {soc:.0f}% >= {GRID_CHARGE_SOC_BLOCK_PCT}%")
@@ -759,12 +768,10 @@ def _apply_trickle_override(soc: float, sp: int, net: float, price: float) -> tu
             )
             return ("BALANCE", 0)
 
-    # Guard 5: expensive price — honour LP discharge
     if price >= p75:
         return (_mode_from_setpoint(sp), sp)
 
     return (_mode_from_setpoint(sp), sp)
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # HA OUTPUT HELPERS
